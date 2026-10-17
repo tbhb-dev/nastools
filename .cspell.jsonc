@@ -1,0 +1,41 @@
+{
+  "language": "en",
+  "ignorePaths": [
+    "**/*.log",
+    // Agent primitives deployed from tbhb-dev/devtools and pinned by
+    // content hash in apm.lock.yaml. Their vocabulary is upstream's.
+    ".agents/skills/**/*",
+    ".agents/rules/**/*",
+    ".claude/rules/**/*",
+    ".claude/skills/**/*",
+    ".claude/worktrees/**/*",
+    ".codex/worktrees/**/*",
+    ".worktrees/**/*",
+    // The vendored devtools payload answers to the publisher's dictionary.
+    ".config/mise/**/*",
+    ".devtools/**/*",
+    ".rumdl_cache/**/*",
+    ".vale/**/*",
+    "apm.lock.yaml",
+    // Vendored Go modules and their checksums are upstream's text.
+    "go.mod",
+    "go.sum",
+    "vendor/**/*",
+    "mise.lock",
+    "dist/**/*",
+    "coverage.xml",
+    // Private values, gitignored; nothing in it belongs in a dictionary.
+    "mise.local.toml",
+    "tmp/**/*",
+    "vendir.lock.yml",
+    "LICENSE"
+  ],
+  "dictionaryDefinitions": [
+    {
+      "name": "nastools",
+      "path": "./.cspell-words.txt",
+      "addWords": true
+    }
+  ],
+  "dictionaries": ["nastools", "golang"]
+}

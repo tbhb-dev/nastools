@@ -1,0 +1,71 @@
+# Local development
+tmp/
+.env
+.env.*
+!.env.example
+.DS_Store
+
+# Private values. mise.local.toml carries NASTOOLS_PRIVATE_STRINGS and any
+# other local override; only mise.local.toml.example is tracked.
+mise.local.toml
+
+# Agent drafts. Authored at the repo root so the Vale and cspell scopes
+# resolve them, linted, consumed, and never committed.
+# COMMIT_AGENTMSG holds the commit message (`mise run lint-commit-msg`).
+# PR_AGENTDESC.md holds the pull request description for as long as the
+# pull request stays open (`mise run lint-pr-description`).
+# SQUASH_AGENTMSG holds the squash commit message (`mise run lint-squash-msg`).
+COMMIT_AGENTMSG
+PR_AGENTDESC.md
+SQUASH_AGENTMSG
+
+# The fix-prose skill keeps each run's baseline, original copy, and notes
+# inside the worktree. The directory also ignores itself.
+.fix-prose/
+
+# Go build output and test artifacts
+/bin/
+/dist/
+/nastools
+/coverage/
+coverage.out
+coverage.html
+coverage.txt
+coverage.xml
+coverage.covdata*/
+*.coverprofile
+testdata/fuzz/
+
+# gremlins
+.gremlins/
+gremlins-report.json
+
+# Linter caches
+.rumdl_cache/
+.cspell-cache
+
+# APM dependencies
+apm_modules/
+
+# Agent worktrees and local harness settings
+.worktrees/
+.claude/worktrees/
+.claude/settings.local.json
+.claude/retros/
+.codex/worktrees/
+.codex/settings.local.json
+.agents/worktrees/
+.agents/settings.local.json
+
+# Vale synced packages (keep the repo-local style and its vocabulary).
+# Each negation needs the parent un-ignored first, because git can't
+# re-include a child whose ancestor directory stays excluded. The ai-tells
+# package ships the agent output template and vale sync writes it under
+# .vale/config/templates/.
+.vale/*
+!.vale/project/
+!.vale/config/
+.vale/config/*
+!.vale/config/vocabularies/
+.vale/config/vocabularies/*
+!.vale/config/vocabularies/project/

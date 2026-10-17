@@ -1,0 +1,238 @@
+#:schema https://mise.jdx.dev/schema/mise.json
+# The repo-specific half of the task and toolchain definitions. The shared
+# half arrives through vendir: tool pins in .config/mise/conf.d/, tasks
+# under .devtools/tasks/ selected by the task_config includes below.
+
+[settings]
+lockfile = true
+# Tool versions come from mise.toml and conf.d alone; stop mise from reading
+# idiomatic version files such as .node-version.
+idiomatic_version_file_enable_tools = []
+
+[tools]
+# vendir can't come from the payload it delivers: bootstrap syncs before it installs.
+vendir = "0.46.1"
+apm = "0.33.0"
+shfmt = "3.14.1"
+jq = "1.8.2"
+# Local workaround for tbhb-dev/devtools#176: the payload pins go 1.27.1,
+# which trails the 1.27.2 security release. Drop this line at the v0.12 bump.
+go = "1.27.2"
+
+[env]
+DEVTOOLS_LOCK_PLATFORMS = "linux-x64,macos-arm64"
+
+# go.toml joins in the Go phase, with the Go task stamps.
+[task_config]
+includes = [
+  ".devtools/tasks/fix.toml",
+  ".devtools/tasks/format.toml",
+  ".devtools/tasks/git-hooks.toml",
+  ".devtools/tasks/leaks.toml",
+  ".devtools/tasks/lint.toml",
+  ".devtools/tasks/pins.toml",
+  ".devtools/tasks/preapproval.toml",
+  ".devtools/tasks/security.toml",
+  ".devtools/tasks/toolchain.toml",
+  ".devtools/tasks/vendir.toml",
+]
+
+[tasks.bootstrap]
+description = "Sync the vendored payload, install the toolchain, and install git hooks"
+alias = "setup"
+run = [
+  "vendir sync",
+  "mise run install-toolchain",
+  "mise run install-tools",
+  "mise run install-guard-markdown",
+  "mise run devtools:prek-install",
+  "mise run install-pre-push",
+]
+
+[tasks.install-toolchain]
+description = "Install the pinned toolchain from mise.toml and the vendored conf.d"
+run = "mise install"
+
+[tasks.install-tools]
+description = "Download the Vale style packages .vale.ini names"
+run = "vale sync"
+
+# guard-markdown backs lint-markdown-wrap and the Claude write hook, and mise
+# has no pin for it. The version comes from the devtools pin in apm.yml, the
+# site devtools:update-pins moves, so a pin bump moves this install too.
+[tasks.install-guard-markdown]
+description = "Install guard-markdown at the version the devtools pin in apm.yml names"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+version=$(bash tools/devtools-pin.sh)
+go install "github.com/tbhb-dev/devtools/cmd/guard-markdown@${version}"
+gobin="$(go env GOPATH)/bin"
+case ":$PATH:" in
+  *":$gobin:"*) ;;
+  *) echo "add $gobin to PATH so guard-markdown resolves" >&2 ;;
+esac
+'''
+
+# The payload's drift gate. It resyncs in place and compares against the git
+# index, so it fails on a tree whose payload is not yet staged.
+[tasks.check-vendored]
+description = "Fail when the vendored payload differs from what vendir.lock.yml pins"
+run = "mise run devtools:check-vendored"
+
+# The leak gate is the payload's check-leaks.sh. The unprefixed name is the
+# one the pre-commit hooks and the lint aggregate call. Private literals come
+# from NASTOOLS_PRIVATE_STRINGS in the gitignored mise.local.toml. Arguments
+# pass through to the script: `mise run lint-leaks -- --staged`. With none it
+# scans the working tree. quiet keeps mise from echoing the arguments, which
+# can be private filenames.
+[tasks.lint-leaks]
+description = "Fail when a file carries a private value or a private-network or credential pattern"
+quiet = true
+run = "bash $DEVTOOLS_DIR/scripts/check-leaks.sh"
+
+[tasks.install-pre-push]
+description = "Put the leak check in front of prek's pre-push hook"
+run = "bash $DEVTOOLS_DIR/scripts/install-pre-push.sh"
+
+[tasks.lint-hooks]
+description = "Fail locally when the leak-check pre-push hook isn't installed"
+run = "mise run devtools:check-leak-hook"
+
+# APM merges hook declarations into each harness's settings additively and
+# never reconciles, while `apm audit --ci` replays the same merge from an
+# empty tree and compares. Clearing the keys APM owns first hands the
+# merge the empty slate its replay assumes. Only those keys go, so a
+# hand-written setting elsewhere in each file survives. devtools:update-pins
+# calls this task by name. The payload's own apm-sync also runs lint-apm,
+# which needs tools/apm_audit.py. This repo owns no Python, so only
+# lint-apm-deploy follows the install, until v0.12 ships lint-apm (#140).
+[tasks.apm-sync]
+description = "Redeploy the APM primitives from a cleared hook state, then check the deploy set"
+depends_post = ["lint-apm-deploy"]
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+clear_key() {
+  local file=$1 key=$2
+  [[ -f $file ]] || return 0
+  jq "del(.$key)" "$file" >"$file.tmp"
+  mv "$file.tmp" "$file"
+  [[ $(jq 'length' "$file") -gt 0 ]] || rm -f "$file"
+}
+clear_key .claude/settings.json hooks
+clear_key .agents/hooks.json apm
+clear_key .codex/hooks.json hooks
+rm -f .claude/apm-hooks.json .agents/apm-hooks.json .codex/apm-hooks.json
+apm install
+'''
+
+# The bare devtools pin plus `target: [claude, codex]` is assumed to
+# deploy the claude, common, and codex packages and nothing for
+# antigravity (D13). This holds that assumption to the recorded deploy.
+[tasks.lint-apm-deploy]
+description = "Fail when the deployed APM primitives differ from the recorded frozen-consumer set"
+run = "bash tools/check-apm-deploy.sh"
+
+[tasks.lint-commit-msg]
+extends = "devtools:lint-commit-msg"
+
+[tasks.lint-squash-msg]
+extends = "devtools:lint-squash-msg"
+
+# The pull request counterpart the pr skill calls. Body adapted from
+# devtools/mise.toml [tasks.lint-pr-description] with a leak scan added;
+# validate-description.sh exists once apm install has deployed the pr skill.
+[tasks.lint-pr-description]
+extends = "devtools:lint-pr-description"
+run = [
+  "bash .claude/skills/pr/scripts/validate-description.sh",
+  "vale --output=ai-tells-agent.tmpl PR_AGENTDESC.md",
+  "cspell --config .cspell.jsonc --no-summary --no-progress PR_AGENTDESC.md",
+  "bash $DEVTOOLS_DIR/scripts/check-leaks.sh PR_AGENTDESC.md",
+]
+
+# The draft task is scoped to the one file it receives, and the fix-prose
+# skills call it by name. The script is a copy of the devtools one.
+[tasks.lint-draft]
+extends = "devtools:lint-draft"
+run = 'bash tools/lint-draft.sh "$usage_file"'
+
+# Body adapted from devtools/mise.toml [tasks.lint-prose]; the glob is why it
+# stays repo-specific. The deployed agent primitives answer to upstream's
+# prose, so the harness trees are excluded (tbhb-dev/devtools#180).
+[tasks.lint-prose]
+extends = "devtools:lint-prose"
+run = "vale --output=ai-tells-agent.tmpl --glob='!{LICENSE,.vale/*,tmp/*,vendor/*,apm_modules/*,.claude/*,.codex/*,.agents/*,.worktrees/*,COMMIT_AGENTMSG,PR_AGENTDESC.md,SQUASH_AGENTMSG}' $usage_paths"
+
+# Invocation args arrive as shell positionals ahead of the file list, so
+# `mise run lint-markdown-wrap -- --fix` reaches guard-markdown as
+# `--fix <files>`. --others puts a new file in the gate before anyone stages
+# it. The pathspecs drop vendored and deployed trees (tbhb-dev/devtools#180).
+[tasks.lint-markdown-wrap]
+description = "Fail if any Markdown paragraph spans more than one line"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+files=$(git ls-files --cached --others --exclude-standard -- '*.md' ':!:vendor/**' ':!:apm_modules/**' ':!:.claude/**' ':!:.codex/**' ':!:.agents/**')
+if [[ -n $files ]]; then guard-markdown "$@" $files; fi
+'''
+
+# Two tasks, not one: the fix-pr skill maps a failing "shell" check to
+# `mise run lint-shell && mise run lint-shell-fmt` (fix-pr/scripts/diagnose.sh).
+# The pathspecs drop vendored and deployed trees (tbhb-dev/devtools#180).
+[tasks.lint-shell]
+description = "Lint the shell scripts via shellcheck"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+files=$(git ls-files --cached --others --exclude-standard -- '*.sh' ':!:vendor/**' ':!:apm_modules/**' ':!:.claude/**' ':!:.codex/**' ':!:.agents/**')
+[[ -z $files ]] || shellcheck $files
+'''
+
+[tasks.lint-shell-fmt]
+description = "Fail if shfmt would reformat any shell script"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+files=$(git ls-files --cached --others --exclude-standard -- '*.sh' ':!:vendor/**' ':!:apm_modules/**' ':!:.claude/**' ':!:.codex/**' ':!:.agents/**')
+[[ -z $files ]] || shfmt -d $files
+'''
+
+# devtools:lint-workflows joins this list in the CI phase, when the first
+# workflow lands (tbhb-dev/devtools#177), and lint-go-all in the Go phase.
+[tasks.lint]
+extends = "devtools:lint"
+run = [
+  "mise run check-vendored",
+  "mise run lint-leaks",
+  "mise run lint-hooks",
+  "mise run devtools:check-pins",
+  "mise run lint-apm-deploy",
+  "mise run lint-prose",
+  "mise run devtools:lint-spelling",
+  "mise run devtools:lint-markdown",
+  "mise run lint-markdown-wrap",
+  "mise run devtools:lint-config",
+  "mise run devtools:lint-yaml",
+  "mise run devtools:lint-toml",
+  "mise run devtools:lint-mise",
+  "mise run lint-shell",
+  "mise run lint-shell-fmt",
+]
+
+[tasks.test-tools]
+description = "Test the devtools pin parser"
+run = "bats tools/devtools-pin.bats"
+
+[tasks.test]
+description = "Run every test suite"
+run = ["mise run test-tools"]
+
+[tasks.check]
+description = "Fast quality bar: lint then test"
+run = ["mise run lint", "mise run test"]
+
+[tasks.check-all]
+description = "Deeper bar: check plus the full-history gitleaks scan"
+run = ["mise run check", "mise run devtools:gitleaks"]

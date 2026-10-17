@@ -1,0 +1,7 @@
+# Repository-owned allow list for check-leaks.sh: one ERE per line, matched
+# against file paths. A match exempts the file from the publishable patterns,
+# never from the private literals in NASTOOLS_PRIVATE_STRINGS.
+# The shared scanner source and its regression suite spell out leak shapes
+# on purpose.
+^\.devtools/scripts/check-leaks\.sh$
+^\.devtools/scripts/check-leaks\.bats$

@@ -1,0 +1,7 @@
+apm.lock.yaml
+vendir.lock.yml
+.worktrees/
+.claude/worktrees/
+.codex/worktrees/
+vendor/
+.config/mise/locks/

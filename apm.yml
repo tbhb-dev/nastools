@@ -1,0 +1,17 @@
+---
+# APM consumer manifest. Pulls the shared devtools agent primitives for
+# Claude and Codex. agy has no APM deployment: its only channel is the
+# root AGENTS.md. The pin is the bare repository form because
+# devtools:update-pins and devtools:check-pins only understand that shape.
+# Move it with `mise run devtools:update-pins <version>`, and redeploy with
+# `mise run apm-sync`, not a bare `apm install`.
+name: nastools
+version: 0.1.0
+description: APM consumer manifest for nastools
+target:
+  - claude
+  - codex
+dependencies:
+  apm:
+    - tbhb-dev/devtools#v0.11.0
+  mcp: []

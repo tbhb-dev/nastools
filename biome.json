@@ -1,0 +1,33 @@
+{
+  "root": true,
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "ignoreUnknown": true,
+    "includes": [
+      "**/*.json",
+      "**/*.jsonc",
+      "**/*.json5",
+      "!vendor",
+      "!dist",
+      "!bin",
+      "!.vale"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space"
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true
+    }
+  },
+  "assist": {
+    "enabled": false
+  }
+}
