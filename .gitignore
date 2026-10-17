@@ -1,8 +1,8 @@
 # Local development
 tmp/
-.env
-.env.*
-!.env.example
+/.env
+/.env.*
+!/.env.example
 .DS_Store
 
 # Private values. mise.local.toml carries NASTOOLS_PRIVATE_STRINGS and any

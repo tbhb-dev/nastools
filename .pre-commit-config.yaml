@@ -49,6 +49,22 @@ repos:
 
   - repo: local
     hooks:
+      # remove when devtools#206 ships a hook
+      - id: gomodscan
+        name: Go module scan
+        entry: mise run --quiet devtools:gomodscan
+        language: system
+        files: ^(go\.(mod|sum)|vendor/)
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: go-fmt
+        name: go format check
+        entry: mise run lint-go-fmt
+        language: system
+        types: [go]
+        pass_filenames: false
+
       - id: ryl
         name: ryl
         entry: mise run devtools:lint-yaml

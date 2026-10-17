@@ -21,13 +21,14 @@ go = "1.27.2"
 
 [env]
 DEVTOOLS_LOCK_PLATFORMS = "linux-x64,macos-arm64"
+DEVTOOLS_GO_MODULES_MODE = "vendor"
 
-# go.toml joins in the Go phase, with the Go task stamps.
 [task_config]
 includes = [
   ".devtools/tasks/fix.toml",
   ".devtools/tasks/format.toml",
   ".devtools/tasks/git-hooks.toml",
+  ".devtools/tasks/go.toml",
   ".devtools/tasks/leaks.toml",
   ".devtools/tasks/lint.toml",
   ".devtools/tasks/pins.toml",
@@ -200,7 +201,7 @@ files=$(git ls-files --cached --others --exclude-standard -- '*.sh' ':!:vendor/*
 '''
 
 # devtools:lint-workflows joins this list in the CI phase, when the first
-# workflow lands (tbhb-dev/devtools#177), and lint-go-all in the Go phase.
+# workflow lands (tbhb-dev/devtools#177).
 [tasks.lint]
 extends = "devtools:lint"
 run = [
@@ -219,6 +220,8 @@ run = [
   "mise run devtools:lint-mise",
   "mise run lint-shell",
   "mise run lint-shell-fmt",
+  "mise run lint-go-all",
+  "mise run lint-go-fmt",
 ]
 
 [tasks.test-tools]
@@ -227,12 +230,95 @@ run = "bats tools/devtools-pin.bats"
 
 [tasks.test]
 description = "Run every test suite"
-run = ["mise run test-tools"]
+run = ["mise run test-tools", "mise run test-go", "mise run cover-go"]
 
 [tasks.check]
 description = "Fast quality bar: lint then test"
 run = ["mise run lint", "mise run test"]
 
+# Local workaround for tbhb-dev/devtools#206: wire the v0.11.0 gomodscan task into a local hook and check-all.
 [tasks.check-all]
-description = "Deeper bar: check plus the full-history gitleaks scan"
-run = ["mise run check", "mise run devtools:gitleaks"]
+description = "Deeper bar: check plus dependency and full-history gitleaks scans"
+run = [
+  "mise run check",
+  "mise run devtools:gomodscan",
+  "mise run vuln",
+  "mise run devtools:gitleaks",
+]
+
+# The v0.11.0 payload lacks run, clean, and lint-go-fmt (#157).
+[tasks.run]
+description = "Run nastools with build metadata, e.g. mise run run version"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+go run -ldflags "$(bash "$DEVTOOLS_DIR/scripts/go-ldflags.sh")" ./cmd/nastools "$@"
+'''
+
+[tasks.clean]
+description = "Clean build artifacts"
+run = "rm -rf bin dist coverage.out coverage.html coverage.txt coverage.xml coverage.covdata*"
+
+[tasks.lint-go-fmt]
+description = "Fail if golangci-lint's formatters would change any Go file"
+run = "golangci-lint fmt --diff ./cmd/... ./internal/..."
+
+# Local workaround for tbhb-dev/devtools#182: detect untracked vendor files.
+# Capture them before regeneration too, since go mod vendor removes stray files.
+[tasks.vendor-check]
+description = "Check that vendor/, go.mod, and go.sum are in sync"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+untracked_before=$(git ls-files --others --exclude-per-directory=.gitignore -- go.mod go.sum vendor/)
+go mod tidy
+go mod vendor
+untracked_after=$(git ls-files --others --exclude-per-directory=.gitignore -- go.mod go.sum vendor/)
+if [[ -n $untracked_before || -n $untracked_after ]] || ! git diff --exit-code -- go.mod go.sum vendor/; then
+  printf '%s\n' "$untracked_before" "$untracked_after" | sort -u >&2
+  echo "vendor drift detected; run 'mise run vendor' and commit" >&2
+  exit 1
+fi
+'''
+
+# Local workaround for tbhb-dev/devtools#202: plain forwarding wrappers.
+# Unprefixed names that the deployed fix-pr skill, the lint and test aggregates, and the docs call. Every other Go task runs by its devtools: name, as devtools' own workflows do.
+[tasks.build]
+description = "Run devtools:build"
+run = "mise run devtools:build"
+
+[tasks.lint-go-all]
+description = "Run devtools:lint-go-all"
+run = "mise run devtools:lint-go-all"
+
+[tasks.lint-go-arch]
+description = "Run devtools:lint-go-arch"
+run = "mise run devtools:lint-go-arch"
+
+[tasks.lint-go-deadcode]
+description = "Run devtools:lint-go-deadcode"
+run = "mise run devtools:lint-go-deadcode"
+
+[tasks.test-go]
+description = "Run devtools:test-go"
+run = "mise run devtools:test-go"
+
+[tasks.test-go-race]
+description = "Run devtools:test-go-race"
+run = "mise run devtools:test-go-race"
+
+[tasks.cover-go]
+description = "Run devtools:cover-go"
+run = "mise run devtools:cover-go"
+
+[tasks.cover-go-check]
+description = "Run devtools:cover-go-check"
+run = "mise run devtools:cover-go-check"
+
+[tasks.vuln]
+description = "Run devtools:vuln"
+run = "mise run devtools:vuln"
+
+[tasks.vendor]
+description = "Run devtools:vendor"
+run = "mise run devtools:vendor"

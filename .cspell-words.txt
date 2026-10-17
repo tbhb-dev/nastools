@@ -44,3 +44,7 @@ worktrees
 nastools
 Synology
 Tailscale
+gochecknoglobals
+gochecknoinits
+nolint
+stretchr

@@ -84,3 +84,5 @@ exceptions:
   - GHSA
   - MAL
   - LTS
+  # Required license-header token in every first-party Go file.
+  - SPDX

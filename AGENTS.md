@@ -14,9 +14,14 @@ This repository is public. Never commit a hostname, an address outside the docum
 
 mise pins the tools and defines the tasks. The shared half arrives from `tbhb-dev/devtools` through vendir into `.config/mise/conf.d/` and `.devtools/`. Never edit those two directories by hand. Run `mise run bootstrap` once. It syncs the payload, then installs the tools and the git hooks.
 
+`nastools` exposes only the `version` command. Its entry point calls `Run` in `run.go`. Tests inject process streams. `internal/buildmeta/` supplies linker-injected metadata and a runtime build-info fallback for the version. `mise run build` writes `bin/nastools` through the payload's linker flags script.
+
 - `mise run lint` runs every lint gate in order.
 - `mise run test` runs the test suites.
 - `mise run check` runs both.
+- `mise run lint-go-all` checks Go code and architecture. `mise run lint-go-fmt` checks formatting.
+- `mise run cover-go` enforces the payload's coverage thresholds. Add tests when coverage drops below a threshold.
+- `mise run vendor` refreshes dependencies. `mise run vendor-check` rejects tracked drift and files outside the index. Keep Go tool directives and their vendored sources in sync.
 - `mise run lint-draft <file>` runs every prose gate over one draft.
 - `mise run devtools:update-pins <version>` moves every devtools pin together. Redeploy the agent primitives with `mise run apm-sync` instead of a bare `apm install`.
 
