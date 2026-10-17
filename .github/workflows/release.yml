@@ -1,0 +1,67 @@
+---
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  MISE_LOCKED: "1"
+  MISE_TASK_RUN_AUTO_INSTALL: "0"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      # Full history and tags let the shared build task derive the version,
+      # commit, and committer date through its existing metadata flags.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up the toolchain
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          # renovate: datasource=github-releases depName=jdx/mise
+          version: 2026.10.3
+          install_args: go
+
+      # Each archive holds one executable named nastools. The platform in
+      # the asset name lets mise's github backend choose the matching build.
+      - name: Build release archives
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist
+          for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64; do
+            GOOS=${target%/*} GOARCH=${target#*/} mise run build
+            tar -czf "dist/nastools_${TAG}_${target%/*}_${target#*/}.tar.gz" -C bin nastools -C .. LICENSE
+          done
+          cd dist
+          sha256sum -- *.tar.gz > checksums.txt
+          sha256sum --check checksums.txt
+
+      # This job consumes the pushed tag; it neither creates nor signs it.
+      # Tag signing remains open: devtools signs before pushing a new tag.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" dist/*.tar.gz dist/checksums.txt --verify-tag --generate-notes

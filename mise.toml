@@ -200,8 +200,6 @@ files=$(git ls-files --cached --others --exclude-standard -- '*.sh' ':!:vendor/*
 [[ -z $files ]] || shfmt -d $files
 '''
 
-# devtools:lint-workflows joins this list in the CI phase, when the first
-# workflow lands (tbhb-dev/devtools#177).
 [tasks.lint]
 extends = "devtools:lint"
 run = [
@@ -218,6 +216,7 @@ run = [
   "mise run devtools:lint-yaml",
   "mise run devtools:lint-toml",
   "mise run devtools:lint-mise",
+  "mise run devtools:lint-workflows",
   "mise run lint-shell",
   "mise run lint-shell-fmt",
   "mise run lint-go-all",
@@ -228,6 +227,7 @@ run = [
 description = "Test the devtools pin parser"
 run = "bats tools/devtools-pin.bats"
 
+# test-leaks stays out until v0.12: the v0.11.0 check-leaks.bats test 25 fails upstream (tbhb-dev/devtools#184).
 [tasks.test]
 description = "Run every test suite"
 run = ["mise run test-tools", "mise run test-go", "mise run cover-go"]

@@ -124,8 +124,6 @@ repos:
         files: \.(json|jsonc|json5)$
         pass_filenames: false
 
-      # Inert until the first workflow lands; devtools:lint-workflows fails
-      # on a repository with none (tbhb-dev/devtools#177).
       - id: actionlint
         name: actionlint
         entry: mise run devtools:lint-workflows
