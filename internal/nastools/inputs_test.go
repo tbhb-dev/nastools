@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"slices"
 	"strings"
 	"testing"
@@ -29,6 +30,15 @@ type fakeOperations struct {
 	env             []string
 	out             bytes.Buffer
 	outputAtCompose string
+	knownHosts      string
+	openErr         error
+	lockErrors      []error
+	pauseErr        error
+	failCommand     string
+	commands        [][]string
+	lockPaths       []string
+	environments    [][]string
+	closed          int
 }
 
 func (f *fakeOperations) ReadFile(path string) ([]byte, error) {
@@ -45,27 +55,50 @@ func (f *fakeOperations) GitState(context.Context, string) (nastools.GitState, e
 	return f.state, f.gitErr
 }
 
-func (f *fakeOperations) Compose(_ context.Context, args, env []string) error {
+func (f *fakeOperations) Compose(_ context.Context, args, env []string, out, errOut io.Writer) error {
 	f.calls = append(f.calls, "compose")
 	f.args, f.env = slices.Clone(args), slices.Clone(env)
 	f.outputAtCompose = f.out.String()
+	f.commands = append(f.commands, slices.Clone(args))
+	f.environments = append(f.environments, slices.Clone(env))
+	if out != nil {
+		if _, err := io.WriteString(out, "compose output\n"); err != nil {
+			return errPrivate
+		}
+		if _, err := io.WriteString(errOut, "compose diagnostic\n"); err != nil {
+			return errPrivate
+		}
+	}
+	if slices.Contains(args, f.failCommand) {
+		return errPrivate
+	}
 	return f.composeErr
 }
 
 func config() nastools.Config {
 	return nastools.Config{
-		Project: "example", Compose: []string{"compose.yaml"}, WaitSeconds: 180,
+		Project:     "example",
+		Compose:     []string{"compose.yaml"},
+		WaitSeconds: 180,
 		RequiredEnv: []string{"REQUIRED_INPUT"},
-		SSH:         nastools.SSH{AddressEnv: "SSH_ADDRESS", UserEnv: "SSH_USER", KnownHostsEnv: "SSH_KNOWN_HOSTS"},
+		SSH: nastools.SSH{
+			AddressEnv:    "SSH_ADDRESS",
+			UserEnv:       "SSH_USER",
+			KnownHostsEnv: "SSH_KNOWN_HOSTS",
+			LockDir:       "/example.invalid/locks",
+		},
 	}
 }
 
 func environment() map[string]string {
 	return map[string]string{
 		"REQUIRED_INPUT": "required.example.invalid", "SSH_ADDRESS": "host.example.invalid:22",
-		"SSH_USER": "user.example.invalid", "SSH_KNOWN_HOSTS": "keys.example.invalid",
+		"SSH_USER": "user.example.invalid", "SSH_KNOWN_HOSTS": knownHostsText,
 	}
 }
+
+const knownHostsText = "host.example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICZ4niA2YR6ErsZQRahQYkioleR/p9/qUOStEMhVy/K5\n" +
+	"[host.example.invalid]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICZ4niA2YR6ErsZQRahQYkioleR/p9/qUOStEMhVy/K5\n"
 
 const configText = `project = "example"
 compose = ["compose.yaml", "/config/override.yaml"]
@@ -74,6 +107,7 @@ required_env = ["REQUIRED_INPUT"]
 address_env = "SSH_ADDRESS"
 user_env = "SSH_USER"
 known_hosts_env = "SSH_KNOWN_HOSTS"
+lock_dir = "/example.invalid/locks"
 [files]
 STATIC_INPUT = "config/static.txt"
 [expand_files]
@@ -90,7 +124,18 @@ func TestCheckPolicy(t *testing.T) {
 	env := environment()
 	env["GITHUB_ACTIONS"] = "true"
 	env["INHERITED_INPUT"] = "inherited.example.invalid"
-	require.NoError(t, nastools.Check(t.Context(), f, "deployment/nastools.toml", env, &f.out))
+	require.NoError(
+		t,
+		nastools.Execute(
+			t.Context(),
+			f,
+			"deployment/nastools.toml",
+			env,
+			&f.out,
+			nil,
+			nastools.Command{Name: nastools.CheckName},
+		),
+	)
 	assert.Equal(t, []string{
 		"read:deployment/nastools.toml", "read:deployment/config/expanded.txt",
 		"read:deployment/config/static.txt", "git", "compose",
@@ -131,7 +176,15 @@ func TestCheckShortCircuit(t *testing.T) {
 			env := environment()
 			env["GITHUB_ACTIONS"] = "true"
 			env["NASTOOLS_PRIVATE_STRINGS"] = "extra.example.invalid"
-			err := nastools.Check(t.Context(), f, "nastools.toml", env, &f.out)
+			err := nastools.Execute(
+				t.Context(),
+				f,
+				"nastools.toml",
+				env,
+				&f.out,
+				nil,
+				nastools.Command{Name: nastools.CheckName},
+			)
 			require.ErrorIs(t, err, nastools.ErrInvalid)
 			assert.Contains(t, err.Error(), tc.want)
 			assert.NotContains(t, err.Error(), errPrivate.Error())
@@ -207,7 +260,7 @@ func TestPrivateValuesAndMasks(t *testing.T) {
 	env["NASTOOLS_PRIVATE_STRINGS"] = " required.example.invalid,extra.example.invalid,xy, ,extra.example.invalid"
 	env["SSH_AUTH_SOCK"] = "socket.example.invalid"
 	assert.Equal(t, []string{
-		"extra.example.invalid", "host.example.invalid:22", "keys.example.invalid",
+		"extra.example.invalid", knownHostsText, "host.example.invalid:22",
 		"required.example.invalid", "user.example.invalid", "xy",
 	}, nastools.PrivateValues(config(), env))
 	for _, tc := range []struct {
@@ -234,7 +287,15 @@ func TestMaskFailureStopsCheck(t *testing.T) {
 	f := &fakeOperations{files: map[string]string{"nastools.toml": configText}}
 	env := environment()
 	env["GITHUB_ACTIONS"] = "true"
-	err := nastools.Check(t.Context(), f, "nastools.toml", env, failingWriter{})
+	err := nastools.Execute(
+		t.Context(),
+		f,
+		"nastools.toml",
+		env,
+		failingWriter{},
+		nil,
+		nastools.Command{Name: nastools.CheckName},
+	)
 	require.ErrorContains(t, err, "mask output")
 	assert.NotContains(t, err.Error(), errPrivate.Error())
 	assert.Equal(t, []string{"read:nastools.toml"}, f.calls)
@@ -252,7 +313,15 @@ func TestCheckWithoutActions(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f := &fakeOperations{}
-			err := nastools.Check(t.Context(), f, "nastools.toml", tc.env, &f.out)
+			err := nastools.Execute(
+				t.Context(),
+				f,
+				"nastools.toml",
+				tc.env,
+				&f.out,
+				nil,
+				nastools.Command{Name: nastools.CheckName},
+			)
 			require.ErrorIs(t, err, nastools.ErrInvalid)
 			assert.Empty(t, f.out.String())
 		})
@@ -268,3 +337,27 @@ func TestExpansionFailureOrder(t *testing.T) {
 	require.ErrorContains(t, err, "expand_files.A_INPUT")
 	assert.Equal(t, []string{"read:a.txt"}, f.calls)
 }
+
+func (f *fakeOperations) Open(_ context.Context, config nastools.SSH, env map[string]string) (string, error) {
+	f.calls = append(f.calls, "open")
+	f.knownHosts = env[config.KnownHostsEnv]
+	return "/example.invalid/socket", f.openErr
+}
+
+func (f *fakeOperations) Lock(_ context.Context, path string) error {
+	f.calls = append(f.calls, "lock")
+	f.lockPaths = append(f.lockPaths, path)
+	if len(f.lockErrors) == 0 {
+		return nil
+	}
+	err := f.lockErrors[0]
+	f.lockErrors = f.lockErrors[1:]
+	return err
+}
+
+func (f *fakeOperations) Pause(context.Context) error {
+	f.calls = append(f.calls, "pause")
+	return f.pauseErr
+}
+
+func (f *fakeOperations) Close() { f.closed++; f.calls = append(f.calls, "close") }

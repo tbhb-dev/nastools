@@ -4,8 +4,11 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"slices"
 
 	"github.com/spf13/cobra"
 
@@ -28,18 +31,34 @@ type streams struct {
 }
 
 // Run executes the command and returns the process exit status.
-func Run(args []string, s streams, ops nastools.Operations, env map[string]string) int {
-	cmd := newRootCmd(s, ops, env)
+func Run(ctx context.Context, args []string, s streams, ops nastools.Operations, env map[string]string) int {
+	cmd := newRootCmd(ctx, s, ops, env)
 	cmd.SetArgs(args)
 
-	if err := cmd.Execute(); err != nil {
+	target, flags, findErr := cmd.Find(args)
+	remote := findErr == nil &&
+		slices.Contains([]string{nastools.CheckName, nastools.Deploy, "status", nastools.Logs}, target.Name())
+	if remote {
+		// Parse flags silently to find the config path before reporting errors.
+		parseErr := target.ParseFlags(flags)
+		if parseErr != nil || target.ValidateArgs(target.Flags().Args()) != nil || target.Flags().Changed("help") {
+			if _, err := nastools.Load(ops, target.Flags().Lookup("config").Value.String(), env, s.out); err != nil {
+				fmt.Fprintln(s.err, "nastools:", err)
+				return exitError
+			}
+		}
+	}
+	if err := cmd.ExecuteContext(ctx); err != nil {
+		if remote && !errors.Is(err, nastools.ErrInvalid) {
+			err = nastools.ErrInvalid
+		}
 		fmt.Fprintln(s.err, "nastools:", err)
 		return exitError
 	}
 	return exitOK
 }
 
-func newRootCmd(s streams, ops nastools.Operations, env map[string]string) *cobra.Command {
+func newRootCmd(ctx context.Context, s streams, ops nastools.Operations, env map[string]string) *cobra.Command {
 	root := &cobra.Command{
 		Use:           "nastools",
 		Short:         "The nastools command-line tool",
@@ -54,17 +73,32 @@ func newRootCmd(s streams, ops nastools.Operations, env map[string]string) *cobr
 	root.SetOut(s.out)
 	root.SetErr(s.err)
 	root.AddCommand(newVersionCmd())
-	path := "nastools.toml"
-	check := &cobra.Command{
-		Use:   "check",
-		Short: "Validate deployment inputs and the Compose model",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return nastools.Check(cmd.Context(), ops, path, env, cmd.OutOrStdout())
-		},
+	for _, name := range []string{nastools.CheckName, nastools.Deploy, "status", nastools.Logs} {
+		const defaultTail = 100
+		request := nastools.Command{Name: name, Tail: defaultTail}
+		configPath := "nastools.toml"
+		command := &cobra.Command{
+			Use: name, Short: "Run Compose " + name, Args: cobra.NoArgs,
+			RunE: func(_ *cobra.Command, args []string) error {
+				if len(args) > 0 {
+					request.Service = args[0]
+				}
+				return nastools.Execute(ctx, ops, configPath, env, s.out, s.err, request)
+			},
+		}
+		command.Flags().StringVar(&configPath, "config", configPath, "Configuration file")
+		if name == nastools.Deploy {
+			command.Flags().
+				DurationVar(&request.LockWait, "lock-wait", 0, "Time to wait for a deployment")
+		}
+		if name == nastools.Logs {
+			command.Use = "logs [service]"
+			command.Args = cobra.MaximumNArgs(1)
+			command.Flags().IntVar(&request.Tail, "tail", request.Tail, "Lines per service")
+			command.Flags().BoolVar(&request.Follow, "follow", false, "Follow log output")
+		}
+		root.AddCommand(command)
 	}
-	check.Flags().StringVar(&path, "config", path, "Configuration file")
-	root.AddCommand(check)
 
 	return root
 }

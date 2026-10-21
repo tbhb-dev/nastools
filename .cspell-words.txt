@@ -19,6 +19,7 @@ golangci
 gomod
 gomodscan
 govulncheck
+knownhosts
 ldflags
 lockfiles
 mktemp
