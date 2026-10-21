@@ -2,6 +2,7 @@ AGENTDESC
 AGENTMSG
 GOPATH
 PYTHONUTF
+RSASHA
 autostash
 buildmeta
 buildvcs

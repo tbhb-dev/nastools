@@ -62,7 +62,7 @@ SSH setup:
 - The configured known-hosts input contains `known_hosts` text, including more than one line. Host keys must match those entries.
 - nastools doesn't read SSH config or invoke an SSH binary or SSH File Transfer Protocol (SFTP) client.
 
-Each run creates a private temporary directory with mode 700 and a local Unix socket. Each socket connection opens an SSH session running `sudo -n /usr/local/bin/docker system dial-stdio`. Local Compose uses that socket through `DOCKER_HOST` and receives the checked input environment. nastools removes inherited Docker context and Transport Layer Security (TLS) settings for this connection. Normal completion, errors, SIGINT, and SIGTERM close the transport and remove its directory.
+Each run creates a private temporary directory with mode 700 and a local Unix socket. Each socket connection opens an SSH session running `sudo -n /usr/local/bin/docker system dial-stdio`. Local Compose uses that socket through `DOCKER_HOST` and receives the checked input environment. nastools replaces inherited `DOCKER_HOST` and removes `DOCKER_CONTEXT`, `DOCKER_TLS`, `DOCKER_TLS_VERIFY`, and `DOCKER_CERT_PATH` for this connection. Normal completion, errors, SIGINT, and SIGTERM close the transport and remove its directory.
 
 The deployment lock is `<lock_dir>/<project>.lock`. An SSH session runs `flock -n <lockfile> cat` and holds the lock through status. If the lock is busy, nastools reports a deployment in progress and exits with an error. `nastools deploy --lock-wait 5m` retries for up to five minutes. The default is no wait. Closing the session releases the lock without persistent lock state or a break command. Different projects use different locks. `status` and `logs` don't get one.
 

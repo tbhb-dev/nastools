@@ -49,7 +49,9 @@ func TestRemoteCommandPolicy(t *testing.T) {
 			env := environment()
 			env["GITHUB_ACTIONS"] = "true"
 			env["DOCKER_HOST"] = "tcp://example.invalid:2375"
-			env["DOCKER_CONTEXT"] = "example.invalid"
+			for _, name := range []string{"DOCKER_CONTEXT", "DOCKER_TLS", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"} {
+				env[name] = "example.invalid"
+			}
 			require.NoError(t, nastools.Execute(t.Context(), f, "nastools.toml", env, &f.out, &f.out, tc.command))
 			assertCommands(t, f, base, tc.want, env)
 			assert.Contains(t, f.out.String(), "::add-mask::"+strings.ReplaceAll(knownHostsText, "\n", "%0A"))
@@ -205,13 +207,24 @@ func assertCommands(t *testing.T, f *fakeOperations, base []string, want [][]str
 			assert.NotContains(t, strings.Join(f.commands[i], " "), private)
 		}
 		if command[0] == "config" {
-			assert.Contains(t, f.environments[i], "DOCKER_CONTEXT=example.invalid")
+			assert.Contains(t, f.environments[i], "DOCKER_HOST="+env["DOCKER_HOST"])
+			for _, name := range []string{"DOCKER_CONTEXT", "DOCKER_TLS", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"} {
+				assert.Contains(t, f.environments[i], name+"="+env[name])
+			}
 			continue
 		}
 		assert.Contains(t, f.environments[i], "DOCKER_HOST=unix:///example.invalid/socket")
 		assert.Contains(t, f.environments[i], "REQUIRED_INPUT=required.example.invalid")
 		for _, entry := range f.environments[i] {
-			assert.False(t, strings.HasPrefix(entry, "DOCKER_CONTEXT="))
+			name, _, _ := strings.Cut(entry, "=")
+			assert.NotContains(
+				t,
+				[]string{"DOCKER_CONTEXT", "DOCKER_TLS", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"},
+				name,
+			)
+			if name == "DOCKER_HOST" {
+				assert.Equal(t, "DOCKER_HOST=unix:///example.invalid/socket", entry)
+			}
 		}
 	}
 }

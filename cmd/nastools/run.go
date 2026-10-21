@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -39,10 +40,11 @@ func Run(ctx context.Context, args []string, s streams, ops nastools.Operations,
 	remote := findErr == nil &&
 		slices.Contains([]string{nastools.CheckName, nastools.Deploy, "status", nastools.Logs}, target.Name())
 	if remote {
-		// Parse flags silently to find the config path before reporting errors.
+		// Find the config even when flag parsing stops before reaching it.
+		target.InitDefaultHelpFlag()
 		parseErr := target.ParseFlags(flags)
 		if parseErr != nil || target.ValidateArgs(target.Flags().Args()) != nil || target.Flags().Changed("help") {
-			if _, err := nastools.Load(ops, target.Flags().Lookup("config").Value.String(), env, s.out); err != nil {
+			if _, err := nastools.Load(ops, configArgument(flags), env, s.out); err != nil {
 				fmt.Fprintln(s.err, "nastools:", err)
 				return exitError
 			}
@@ -56,6 +58,21 @@ func Run(ctx context.Context, args []string, s streams, ops nastools.Operations,
 		return exitError
 	}
 	return exitOK
+}
+
+func configArgument(flags []string) string {
+	configPath := "nastools.toml"
+	for i, flag := range flags {
+		if flag == "--" {
+			break
+		}
+		if flag == "--config" && i+1 < len(flags) {
+			configPath = flags[i+1]
+		} else if value, ok := strings.CutPrefix(flag, "--config="); ok {
+			configPath = value
+		}
+	}
+	return configPath
 }
 
 func newRootCmd(ctx context.Context, s streams, ops nastools.Operations, env map[string]string) *cobra.Command {

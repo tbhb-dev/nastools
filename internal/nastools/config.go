@@ -322,7 +322,10 @@ func Execute(ctx context.Context, ops Operations, path string, env map[string]st
 	}
 	inputs.Env = append(slices.DeleteFunc(inputs.Env, func(entry string) bool {
 		name, _, _ := strings.Cut(entry, "=")
-		return slices.Contains([]string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"}, name)
+		return slices.Contains(
+			[]string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"},
+			name,
+		)
 	}), "DOCKER_HOST=unix://"+socket)
 	for _, args := range command.arguments(inputs.Config.WaitSeconds) {
 		if err = compose(ctx, ops, inputs, args, out, errOut); err != nil {

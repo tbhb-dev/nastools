@@ -128,6 +128,8 @@ func TestRemoteCommandsMaskErrors(t *testing.T) {
 		{"deploy", "--lock-wait", "private.example.invalid"},
 		{"logs", "--unknown=private.example.invalid"},
 		{"status", "private.example.invalid"},
+		{"deploy", "--config"},
+		{"deploy", "--unknown", "--", "--config", "ignored"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			t.Parallel()
@@ -156,6 +158,8 @@ func TestRemoteFlagAndArgumentErrors(t *testing.T) {
 		{"deploy", "--lock-wait", "private.example.invalid"},
 		{"logs", "--unknown=private.example.invalid"},
 		{"status", "private.example.invalid"},
+		{"deploy", "--config"},
+		{"deploy", "--unknown", "--", "--config", "ignored"},
 		{"logs", "--help"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
@@ -177,5 +181,47 @@ func TestRemoteFlagAndArgumentErrors(t *testing.T) {
 				"private.example.invalid",
 			)
 		})
+	}
+}
+
+func TestRemoteConfigAfterFlagError(t *testing.T) {
+	t.Parallel()
+	for _, prefix := range [][]string{
+		{"deploy", "--unknown=required.example.invalid"},
+		{"deploy", "--lock-wait", "required.example.invalid"},
+		{"logs", "--help"},
+	} {
+		for _, configFlag := range [][]string{
+			{"--config", "example.invalid/custom.toml"},
+			{"--config=example.invalid/custom.toml"},
+		} {
+			args := append(slices.Clone(prefix), configFlag...)
+			t.Run(strings.Join(args, " "), func(t *testing.T) {
+				t.Parallel()
+				var out bytes.Buffer
+				f := &unreadableConfigOperations{data: []byte(`required_env = ["REQUIRED"]
+[ssh]
+address_env = "ADDRESS"
+user_env = "USER"
+known_hosts_env = "KNOWN_HOSTS"
+`)}
+				code := Run(t.Context(), args, streams{out: &out, err: &out}, f, map[string]string{
+					"GITHUB_ACTIONS": "true", "REQUIRED": "required.example.invalid",
+					"ADDRESS": "nas.example.invalid:22", "USER": "user.example.invalid",
+					"KNOWN_HOSTS": "key.example.invalid",
+				})
+				assert.Equal(t, "example.invalid/custom.toml", f.path)
+				masks := "::add-mask::key.example.invalid\n::add-mask::nas.example.invalid:22\n" +
+					"::add-mask::required.example.invalid\n::add-mask::user.example.invalid\n"
+				assert.True(t, strings.HasPrefix(out.String(), masks))
+				if slices.Contains(prefix, "--help") {
+					assert.Equal(t, exitOK, code)
+					assert.Contains(t, out.String(), "Usage:")
+				} else {
+					assert.Equal(t, exitError, code)
+					assert.Equal(t, masks+"nastools: invalid or missing input\n", out.String())
+				}
+			})
+		}
 	}
 }

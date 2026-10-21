@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -40,11 +41,18 @@ func main() {
 	os.Exit(code)
 }
 
+const (
+	sshDialTimeout      = 30 * time.Second
+	sshHandshakeTimeout = 30 * time.Second
+	forwardSessionLimit = 8
+)
+
 type operations struct {
 	client  *ssh.Client
 	dir     string
 	cancel  context.CancelFunc
 	closers []io.Closer
+	workers sync.WaitGroup
 }
 
 func (*operations) ReadFile(path string) ([]byte, error) {
@@ -93,18 +101,30 @@ func (o *operations) Open(ctx context.Context, config nastools.SSH, env map[stri
 	defer agentConn.Close()
 	stopAgent := context.AfterFunc(ctx, func() { _ = agentConn.Close() })
 	defer stopAgent()
-	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", env[config.AddressEnv])
+	raw, err := (&net.Dialer{Timeout: sshDialTimeout}).DialContext(ctx, "tcp", env[config.AddressEnv])
 	if err != nil {
 		return "", nastools.ErrInvalid
 	}
 	o.closers = append(o.closers, raw)
 	context.AfterFunc(ctx, func() { _ = raw.Close() })
+	if raw.SetDeadline(time.Now().Add(sshHandshakeTimeout)) != nil {
+		return "", nastools.ErrInvalid
+	}
 	conn, channels, requests, err := ssh.NewClientConn(raw, env[config.AddressEnv], &ssh.ClientConfig{
 		User:            env[config.UserEnv],
 		Auth:            []ssh.AuthMethod{ssh.PublicKeysCallback(agent.NewClient(agentConn).Signers)},
 		HostKeyCallback: verify,
+		HostKeyAlgorithms: hostKeyAlgorithms(
+			verify,
+			env[config.AddressEnv],
+			raw.RemoteAddr(),
+			env[config.KnownHostsEnv],
+		),
 	})
 	if err != nil {
+		return "", nastools.ErrInvalid
+	}
+	if raw.SetDeadline(time.Time{}) != nil {
 		return "", nastools.ErrInvalid
 	}
 	o.client = ssh.NewClient(conn, channels, requests)
@@ -114,38 +134,89 @@ func (o *operations) Open(ctx context.Context, config nastools.SSH, env map[stri
 		return "", nastools.ErrInvalid
 	}
 	o.closers = append(o.closers, listener)
-	go o.forward(listener)
+	context.AfterFunc(ctx, func() { _ = listener.Close() })
+	o.workers.Go(func() { o.forward(ctx, listener) })
 	return socket, nil
 }
 
-func (o *operations) forward(listener net.Listener) {
+func hostKeyAlgorithms(verify ssh.HostKeyCallback, address string, remote net.Addr, text string) []string {
+	var algorithms []string
+	for data := []byte(text); len(data) > 0; {
+		_, _, key, _, rest, parseErr := ssh.ParseKnownHosts(data)
+		if parseErr != nil {
+			break
+		}
+		data = rest
+		if verify(address, remote, key) == nil {
+			if key.Type() == ssh.KeyAlgoRSA {
+				algorithms = append(algorithms, ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256)
+			}
+			algorithms = append(algorithms, key.Type())
+		}
+	}
+	return algorithms
+}
+
+func (o *operations) forward(ctx context.Context, listener net.Listener) {
+	var workers sync.WaitGroup
+	defer workers.Wait()
+	slots := make(chan struct{}, forwardSessionLimit)
 	for {
 		local, err := listener.Accept()
 		if err != nil {
 			return
 		}
-		go func() {
-			defer local.Close()
-			session, sessionErr := o.client.NewSession()
-			if sessionErr != nil {
-				return
-			}
-			defer session.Close()
-			session.Stdin, session.Stdout = local, local
-			if session.Run("sudo -n /usr/local/bin/docker system dial-stdio") != nil {
-				return
-			}
-		}()
+		// Listener shutdown closes every accepted connection before joining workers.
+		defer local.Close()
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+		workers.Go(func() {
+			defer func() { <-slots }()
+			o.forwardConnection(local)
+		})
+	}
+}
+
+func (o *operations) forwardConnection(local net.Conn) {
+	defer local.Close()
+	session, sessionErr := o.client.NewSession()
+	if sessionErr != nil {
+		return
+	}
+	defer session.Close()
+	input, inputErr := session.StdinPipe()
+	output, outputErr := session.StdoutPipe()
+	startErr := session.Start("sudo -n /usr/local/bin/docker system dial-stdio")
+	if errors.Join(inputErr, outputErr, startErr) != nil {
+		return
+	}
+	copied := make(chan struct{})
+	go func() {
+		defer close(copied)
+		defer input.Close()
+		if _, copyErr := io.Copy(input, local); copyErr != nil {
+			return
+		}
+	}()
+	_, copyErr := io.Copy(local, output)
+	_ = local.Close()   // Remote end of stream must also unblock the local reader.
+	_ = session.Close() // Unblock a copier waiting for the remote window.
+	<-copied
+	if errors.Join(copyErr, session.Wait()) != nil {
+		return
 	}
 }
 
 func (o *operations) Lock(ctx context.Context, path string) error {
+	stop := context.AfterFunc(ctx, func() { _ = o.client.Close() })
+	defer stop()
 	session, err := o.client.NewSession()
 	if err != nil {
 		return nastools.ErrInvalid
 	}
-	stop := context.AfterFunc(ctx, func() { _ = session.Close() })
-	defer stop()
 	input, inputErr := session.StdinPipe()
 	output, outputErr := session.StdoutPipe()
 	command := "flock -n '" + strings.ReplaceAll(path, "'", "'\\''") + "' cat"
@@ -168,11 +239,11 @@ func (o *operations) Lock(ctx context.Context, path string) error {
 		return nastools.ErrInvalid
 	}
 	o.closers = append(o.closers, input)
-	go func() {
+	o.workers.Go(func() {
 		if session.Wait() != nil {
 			o.cancel()
 		}
-	}()
+	})
 	return nil
 }
 
@@ -190,6 +261,7 @@ func (o *operations) Close() {
 		_ = closer.Close()
 	}
 	o.cancel()
+	o.workers.Wait()
 	_ = os.RemoveAll(o.dir)
 }
 
