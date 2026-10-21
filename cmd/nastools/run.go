@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/tbhb-dev/nastools/internal/buildmeta"
+	"github.com/tbhb-dev/nastools/internal/nastools"
 )
 
 // Exit statuses.
@@ -27,8 +28,8 @@ type streams struct {
 }
 
 // Run executes the command and returns the process exit status.
-func Run(args []string, s streams) int {
-	cmd := newRootCmd(s)
+func Run(args []string, s streams, ops nastools.Operations, env map[string]string) int {
+	cmd := newRootCmd(s, ops, env)
 	cmd.SetArgs(args)
 
 	if err := cmd.Execute(); err != nil {
@@ -38,7 +39,7 @@ func Run(args []string, s streams) int {
 	return exitOK
 }
 
-func newRootCmd(s streams) *cobra.Command {
+func newRootCmd(s streams, ops nastools.Operations, env map[string]string) *cobra.Command {
 	root := &cobra.Command{
 		Use:           "nastools",
 		Short:         "The nastools command-line tool",
@@ -53,6 +54,17 @@ func newRootCmd(s streams) *cobra.Command {
 	root.SetOut(s.out)
 	root.SetErr(s.err)
 	root.AddCommand(newVersionCmd())
+	path := "nastools.toml"
+	check := &cobra.Command{
+		Use:   "check",
+		Short: "Validate deployment inputs and the Compose model",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return nastools.Check(cmd.Context(), ops, path, env, cmd.OutOrStdout())
+		},
+	}
+	check.Flags().StringVar(&path, "config", path, "Configuration file")
+	root.AddCommand(check)
 
 	return root
 }
