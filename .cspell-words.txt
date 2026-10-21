@@ -48,3 +48,4 @@ gochecknoglobals
 gochecknoinits
 nolint
 stretchr
+wrapcheck

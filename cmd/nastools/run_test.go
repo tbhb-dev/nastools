@@ -22,7 +22,7 @@ type harness struct {
 
 func exec(args ...string) harness {
 	var out, errOut bytes.Buffer
-	code := Run(args, streams{in: strings.NewReader(""), out: &out, err: &errOut})
+	code := Run(args, streams{in: strings.NewReader(""), out: &out, err: &errOut}, nil, nil)
 	return harness{code: code, stdout: out.String(), stderr: errOut.String()}
 }
 
@@ -71,7 +71,7 @@ func TestVersionWriteFailure(t *testing.T) {
 	t.Parallel()
 
 	var errOut bytes.Buffer
-	code := Run([]string{"version"}, streams{in: strings.NewReader(""), out: failingWriter{}, err: &errOut})
+	code := Run([]string{"version"}, streams{in: strings.NewReader(""), out: failingWriter{}, err: &errOut}, nil, nil)
 	assert.Equal(t, exitError, code)
 	assert.Contains(t, errOut.String(), "write version")
 }
