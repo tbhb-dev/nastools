@@ -3,6 +3,7 @@ AGENTMSG
 GOPATH
 PYTHONUTF
 RSASHA
+agentrepo
 autostash
 buildmeta
 buildvcs

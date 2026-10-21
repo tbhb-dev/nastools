@@ -15,9 +15,12 @@ vendir = "0.46.1"
 apm = "0.33.0"
 shfmt = "3.14.1"
 jq = "1.8.2"
-# Local workaround for tbhb-dev/devtools#176: the payload pins go 1.27.1,
-# which trails the 1.27.2 security release. Drop this line at the v0.12 bump.
-go = "1.27.2"
+# The devtools commands, at the release the payload comes from.
+# devtools:update-pins reads and moves these three lines, so they stay at
+# column 0 in this form.
+"go:github.com/tbhb-dev/devtools/cmd/guard-markdown" = "v0.14.0"
+"go:github.com/tbhb-dev/devtools/cmd/commit-lint" = "v0.14.0"
+"go:github.com/tbhb-dev/devtools/cmd/agentrepo" = "v0.14.0"
 
 [env]
 DEVTOOLS_LOCK_PLATFORMS = "linux-x64,macos-arm64"
@@ -25,6 +28,7 @@ DEVTOOLS_GO_MODULES_MODE = "vendor"
 
 [task_config]
 includes = [
+  ".devtools/tasks/apm.toml",
   ".devtools/tasks/fix.toml",
   ".devtools/tasks/format.toml",
   ".devtools/tasks/git-hooks.toml",
@@ -45,9 +49,8 @@ run = [
   "vendir sync",
   "mise run install-toolchain",
   "mise run install-tools",
-  "mise run install-guard-markdown",
   "mise run devtools:prek-install",
-  "mise run install-pre-push",
+  "mise run devtools:install-pre-push-hook",
 ]
 
 [tasks.install-toolchain]
@@ -58,75 +61,21 @@ run = "mise install"
 description = "Download the Vale style packages .vale.ini names"
 run = "vale sync"
 
-# guard-markdown backs lint-markdown-wrap and the Claude write hook, and mise
-# has no pin for it. The version comes from the devtools pin in apm.yml, the
-# site devtools:update-pins moves, so a pin bump moves this install too.
-[tasks.install-guard-markdown]
-description = "Install guard-markdown at the version the devtools pin in apm.yml names"
-run = '''
-#!/usr/bin/env bash
-set -euo pipefail
-version=$(bash tools/devtools-pin.sh)
-go install "github.com/tbhb-dev/devtools/cmd/guard-markdown@${version}"
-gobin="$(go env GOPATH)/bin"
-case ":$PATH:" in
-  *":$gobin:"*) ;;
-  *) echo "add $gobin to PATH so guard-markdown resolves" >&2 ;;
-esac
-'''
-
 # The payload's drift gate. It resyncs in place and compares against the git
 # index, so it fails on a tree whose payload is not yet staged.
 [tasks.check-vendored]
 description = "Fail when the vendored payload differs from what vendir.lock.yml pins"
 run = "mise run devtools:check-vendored"
 
-# The leak gate is the payload's check-leaks.sh. The unprefixed name is the
-# one the pre-commit hooks and the lint aggregate call. Private literals come
-# from NASTOOLS_PRIVATE_STRINGS in the gitignored mise.local.toml. Arguments
-# pass through to the script: `mise run lint-leaks -- --staged`. With none it
-# scans the working tree. quiet keeps mise from echoing the arguments, which
-# can be private filenames.
+# The unprefixed name the lint aggregate, ci.yml and AGENTS.md call. Private
+# literals come from NASTOOLS_PRIVATE_STRINGS in the gitignored
+# mise.local.toml. Arguments pass through to the leak check:
+# `mise run lint-leaks -- --staged`. With none it scans the working tree.
+# quiet keeps mise from echoing the arguments, which can be private filenames.
 [tasks.lint-leaks]
-description = "Fail when a file carries a private value or a private-network or credential pattern"
+description = "Run devtools:lint-leaks"
 quiet = true
-run = "bash $DEVTOOLS_DIR/scripts/check-leaks.sh"
-
-[tasks.install-pre-push]
-description = "Put the leak check in front of prek's pre-push hook"
-run = "bash $DEVTOOLS_DIR/scripts/install-pre-push.sh"
-
-[tasks.lint-hooks]
-description = "Fail locally when the leak-check pre-push hook isn't installed"
-run = "mise run devtools:check-leak-hook"
-
-# APM merges hook declarations into each harness's settings additively and
-# never reconciles, while `apm audit --ci` replays the same merge from an
-# empty tree and compares. Clearing the keys APM owns first hands the
-# merge the empty slate its replay assumes. Only those keys go, so a
-# hand-written setting elsewhere in each file survives. devtools:update-pins
-# calls this task by name. The payload's own apm-sync also runs lint-apm,
-# which needs tools/apm_audit.py. This repo owns no Python, so only
-# lint-apm-deploy follows the install, until v0.12 ships lint-apm (#140).
-[tasks.apm-sync]
-description = "Redeploy the APM primitives from a cleared hook state, then check the deploy set"
-depends_post = ["lint-apm-deploy"]
-run = '''
-#!/usr/bin/env bash
-set -euo pipefail
-clear_key() {
-  local file=$1 key=$2
-  [[ -f $file ]] || return 0
-  jq "del(.$key)" "$file" >"$file.tmp"
-  mv "$file.tmp" "$file"
-  [[ $(jq 'length' "$file") -gt 0 ]] || rm -f "$file"
-}
-clear_key .claude/settings.json hooks
-clear_key .agents/hooks.json apm
-clear_key .codex/hooks.json hooks
-rm -f .claude/apm-hooks.json .agents/apm-hooks.json .codex/apm-hooks.json
-apm install
-'''
+run = "mise run --quiet devtools:lint-leaks --"
 
 # The bare devtools pin plus `target: [claude, codex]` is assumed to
 # deploy the claude, common, and codex packages and nothing for
@@ -153,90 +102,60 @@ run = [
   "bash $DEVTOOLS_DIR/scripts/check-leaks.sh PR_AGENTDESC.md",
 ]
 
-# The draft task is scoped to the one file it receives, and the fix-prose
-# skills call it by name. The script is a copy of the devtools one.
+# The fix-prose skills call both draft tasks by name; the payload supplies
+# their bodies.
 [tasks.lint-draft]
 extends = "devtools:lint-draft"
-run = 'bash tools/lint-draft.sh "$usage_file"'
 
-# Body adapted from devtools/mise.toml [tasks.lint-prose]; the glob is why it
-# stays repo-specific. The deployed agent primitives answer to upstream's
-# prose, so the harness trees are excluded (tbhb-dev/devtools#180).
+[tasks.fix-prose-replacements]
+extends = "devtools:fix-prose-replacements"
+
+# The glob is consumer prose policy, so the body stays repo-specific. The
+# deployed agent primitives answer to upstream's prose, so the harness trees
+# are excluded, and so is the vendored .devtools/ payload, which is
+# upstream's text, like vendor/.
 [tasks.lint-prose]
 extends = "devtools:lint-prose"
-run = "vale --output=ai-tells-agent.tmpl --glob='!{LICENSE,.vale/*,tmp/*,vendor/*,apm_modules/*,.claude/*,.codex/*,.agents/*,.worktrees/*,COMMIT_AGENTMSG,PR_AGENTDESC.md,SQUASH_AGENTMSG}' $usage_paths"
+run = "vale --output=ai-tells-agent.tmpl --glob='!{LICENSE,.vale/*,.devtools/*,tmp/*,vendor/*,apm_modules/*,.claude/*,.codex/*,.agents/*,.worktrees/*,COMMIT_AGENTMSG,PR_AGENTDESC.md,SQUASH_AGENTMSG}' $usage_paths"
 
-# Invocation args arrive as shell positionals ahead of the file list, so
-# `mise run lint-markdown-wrap -- --fix` reaches guard-markdown as
-# `--fix <files>`. --others puts a new file in the gate before anyone stages
-# it. The pathspecs drop vendored and deployed trees (tbhb-dev/devtools#180).
+# The unprefixed name the rebase skill's preflight and AGENTS.md call.
+# Arguments pass through, so `mise run lint-markdown-wrap -- --fix` reaches
+# guard-markdown.
 [tasks.lint-markdown-wrap]
-description = "Fail if any Markdown paragraph spans more than one line"
-run = '''
-#!/usr/bin/env bash
-set -euo pipefail
-files=$(git ls-files --cached --others --exclude-standard -- '*.md' ':!:vendor/**' ':!:apm_modules/**' ':!:.claude/**' ':!:.codex/**' ':!:.agents/**')
-if [[ -n $files ]]; then guard-markdown "$@" $files; fi
-'''
-
-# Two tasks, not one: the fix-pr skill maps a failing "shell" check to
-# `mise run lint-shell && mise run lint-shell-fmt` (fix-pr/scripts/diagnose.sh).
-# The pathspecs drop vendored and deployed trees (tbhb-dev/devtools#180).
-[tasks.lint-shell]
-description = "Lint the shell scripts via shellcheck"
-run = '''
-#!/usr/bin/env bash
-set -euo pipefail
-files=$(git ls-files --cached --others --exclude-standard -- '*.sh' ':!:vendor/**' ':!:apm_modules/**' ':!:.claude/**' ':!:.codex/**' ':!:.agents/**')
-[[ -z $files ]] || shellcheck $files
-'''
-
-[tasks.lint-shell-fmt]
-description = "Fail if shfmt would reformat any shell script"
-run = '''
-#!/usr/bin/env bash
-set -euo pipefail
-files=$(git ls-files --cached --others --exclude-standard -- '*.sh' ':!:vendor/**' ':!:apm_modules/**' ':!:.claude/**' ':!:.codex/**' ':!:.agents/**')
-[[ -z $files ]] || shfmt -d $files
-'''
+description = "Run devtools:lint-markdown-wrap"
+run = "mise run devtools:lint-markdown-wrap --"
 
 [tasks.lint]
 extends = "devtools:lint"
 run = [
   "mise run check-vendored",
   "mise run lint-leaks",
-  "mise run lint-hooks",
+  "mise run devtools:check-pre-push-hook",
   "mise run devtools:check-pins",
   "mise run lint-apm-deploy",
   "mise run lint-prose",
   "mise run devtools:lint-spelling",
   "mise run devtools:lint-markdown",
-  "mise run lint-markdown-wrap",
+  "mise run devtools:lint-markdown-wrap",
   "mise run devtools:lint-config",
   "mise run devtools:lint-yaml",
   "mise run devtools:lint-toml",
   "mise run devtools:lint-mise",
   "mise run devtools:lint-workflows",
-  "mise run lint-shell",
-  "mise run lint-shell-fmt",
+  "mise run devtools:lint-shell",
+  "mise run devtools:lint-shell-fmt",
   "mise run lint-go-all",
   "mise run lint-go-fmt",
 ]
 
-[tasks.test-tools]
-description = "Test the devtools pin parser"
-run = "bats tools/devtools-pin.bats"
-
-# test-leaks stays out until v0.12: the v0.11.0 check-leaks.bats test 25 fails upstream (tbhb-dev/devtools#184).
 [tasks.test]
 description = "Run every test suite"
-run = ["mise run test-tools", "mise run test-go", "mise run cover-go"]
+run = ["mise run test-go", "mise run cover-go"]
 
 [tasks.check]
 description = "Fast quality bar: lint then test"
 run = ["mise run lint", "mise run test"]
 
-# Local workaround for tbhb-dev/devtools#206: wire the v0.11.0 gomodscan task into a local hook and check-all.
 [tasks.check-all]
 description = "Deeper bar: check plus dependency and full-history gitleaks scans"
 run = [
@@ -246,7 +165,7 @@ run = [
   "mise run devtools:gitleaks",
 ]
 
-# The v0.11.0 payload lacks run, clean, and lint-go-fmt (#157).
+# The payload lacks run, clean, and lint-go-fmt (tbhb-dev/devtools#283).
 [tasks.run]
 description = "Run nastools with build metadata, e.g. mise run run version"
 run = '''
@@ -263,8 +182,9 @@ run = "rm -rf bin dist coverage.out coverage.html coverage.txt coverage.xml cove
 description = "Fail if golangci-lint's formatters would change any Go file"
 run = "golangci-lint fmt --diff ./cmd/... ./internal/..."
 
-# Local workaround for tbhb-dev/devtools#182: detect untracked vendor files.
-# Capture them before regeneration too, since go mod vendor removes stray files.
+# Local workaround for tbhb-dev/devtools#289: devtools:vendor-check looks for
+# untracked vendor files only after regeneration. Capture them before too,
+# since go mod vendor removes stray files.
 [tasks.vendor-check]
 description = "Check that vendor/, go.mod, and go.sum are in sync"
 run = '''
@@ -281,8 +201,9 @@ if [[ -n $untracked_before || -n $untracked_after ]] || ! git diff --exit-code -
 fi
 '''
 
-# Local workaround for tbhb-dev/devtools#202: plain forwarding wrappers.
-# Unprefixed names that the deployed fix-pr skill, the lint and test aggregates, and the docs call. Every other Go task runs by its devtools: name, as devtools' own workflows do.
+# Plain forwarding wrappers for the unprefixed names that ci.yml, release.yml,
+# the lint and test aggregates, and the docs call. Every other Go task runs by
+# its devtools: name, as devtools' own workflows do.
 [tasks.build]
 description = "Run devtools:build"
 run = "mise run devtools:build"

@@ -12,7 +12,8 @@ exclude: ^(vendor/|bin/|dist/)
 # manager tracks.
 #
 # Install with `mise run devtools:prek-install`, which sets up the
-# commit-msg, pre-commit, pre-push, and post-commit stages.
+# commit-msg, pre-commit, pre-push, and post-commit stages, then
+# `mise run devtools:install-pre-push-hook`.
 
 repos:
   - repo: builtin
@@ -27,15 +28,15 @@ repos:
       - id: trailing-whitespace
 
   # The shared hooks: the commit-msg gates, the post-commit hook that deletes
-  # the COMMIT_AGENTMSG draft once a commit lands, guard-markdown, and the
-  # leak check at three stages. vale-commit-msg and cspell-commit-msg read
-  # this repository's .vale.ini and .cspell.jsonc. leaks-staged scans the
-  # index blobs, so a private value cannot hide behind a cleaned working
-  # file. leaks-pre-push only asserts that the install-pre-push wrapper
-  # sits in front of prek's pre-push hook, because prek hides git's ref
-  # lines from its hooks.
+  # the COMMIT_AGENTMSG draft once a commit lands, guard-markdown, the Go
+  # module scan, and the leak check at three stages. vale-commit-msg and
+  # cspell-commit-msg read this repository's .vale.ini and .cspell.jsonc.
+  # leaks-staged scans the index blobs, so a private value cannot hide
+  # behind a cleaned working file. leaks-pre-push only asserts that the
+  # devtools:install-pre-push-hook wrapper sits in front of prek's pre-push
+  # hook, because prek hides git's ref lines from its hooks.
   - repo: https://github.com/tbhb-dev/devtools
-    rev: 902790ab90cb5e018d22c54ea4bb12711f632253  # frozen: v0.11.0
+    rev: 830abe6dadce3e0b4c7ab4c5065560d2c3c76ed9  # frozen: v0.14.0
     hooks:
       - id: commit-trailers
       - id: commitlint
@@ -43,21 +44,13 @@ repos:
       - id: cspell-commit-msg
       - id: clear-commit-agentmsg
       - id: guard-markdown
+      - id: gomodscan
       - id: leaks-staged
       - id: leaks-commit-msg
       - id: leaks-pre-push
 
   - repo: local
     hooks:
-      # remove when devtools#206 ships a hook
-      - id: gomodscan
-        name: Go module scan
-        entry: mise run --quiet devtools:gomodscan
-        language: system
-        files: ^(go\.(mod|sum)|vendor/)
-        pass_filenames: false
-        stages: [pre-commit]
-
       - id: go-fmt
         name: go format check
         entry: mise run lint-go-fmt
@@ -87,14 +80,14 @@ repos:
 
       - id: lint-shell
         name: shellcheck
-        entry: mise run lint-shell
+        entry: mise run devtools:lint-shell
         language: system
         files: ^.*\.sh$
         pass_filenames: false
 
       - id: lint-shell-fmt
         name: shfmt
-        entry: mise run lint-shell-fmt
+        entry: mise run devtools:lint-shell-fmt
         language: system
         files: ^.*\.sh$
         pass_filenames: false
@@ -151,5 +144,6 @@ repos:
         name: devtools pin agreement
         entry: mise run devtools:check-pins
         language: system
-        files: ^(apm\.yml|vendir\.yml|\.pre-commit-config\.yaml|\.github/renovate\.json5|\.github/workflows/.*)$
+        files: "^(apm\\.yml|vendir\\.yml|mise\\.toml|tombi\\.toml|\\.pre-commit-config\\.yaml|\
+          \\.github/renovate\\.json5|\\.github/workflows/.*)$"
         pass_filenames: false

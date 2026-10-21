@@ -36,13 +36,13 @@ Stop before any of it where preflight reports a missing precondition, a draft pu
 
 Preflight printed the state, the checks, and the review decision. Merging needs an open pull request that nobody marked as a draft, with every check green.
 
-Preflight judges each check by its latest run. A workflow that started twice on one head and cancelled the first run leaves those cancelled jobs behind, and preflight leaves them out and says how many it left out. A cancelled run with no later run still counts as failing.
+For each check, preflight judges its latest run. A workflow that started twice on one head and cancelled the first run leaves those cancelled jobs behind, and preflight leaves them out and says how many it left out. Without a later run, a cancelled run still counts as failing.
 
 A failing check goes to `fix-pr`, and a running one goes to `watch-pr`. Neither belongs here, and the merge script refuses both anyway.
 
 A `mergeStateStatus` of `BEHIND` or `DIRTY` is the third case. The branch needs the base underneath it before anything merges, so run the `rebase` skill and push the result. Don't reach for GitHub's own update button: it merges the base into the branch, which leaves a merge commit this workflow never wrote a message for.
 
-Where the repository requires a review decision, respect it. `CHANGES_REQUESTED` means the merge waits, whatever the checks say, and the merge script refuses anything but an approval where the repository requires one.
+For `REVIEW_REQUIRED` or `CHANGES_REQUESTED`, preflight exits 75 with `WAITING_REVIEW`. Resolve the required approvals, then rerun. Review checks before invoking the reviewer. Merge checks again before the merge state.
 
 ## Step 2: settle the description first
 
@@ -58,7 +58,7 @@ Merging is the last moment the description can change, and you write the squash 
 
 Read what preflight printed under `== description as published ==` against the commits it collapses. Most merges skip the rest of this step. A description that still fits doesn't need a pass, and a pull request nobody here authored has none of this machinery behind it, so take its description as it stands.
 
-Where it no longer describes the branch, run `write-pr-description` and then `review-pr-description`, following the `pr` review loop, then republish with `bash .agents/skills/pr/scripts/create-pr.sh`.
+Where it no longer describes the branch, revise `PR_AGENTDESC.md` in this session or use the optional `write-pr-description` helper, then run the `pr` review script, following its review loop, then republish with `bash .agents/skills/pr/scripts/create-pr.sh`.
 
 ## Step 3: write the squash message
 
@@ -110,20 +110,22 @@ Read those lines, then check the `Closes` lines that remain against the branch. 
 
 ## Step 4: run the commit-msg gates
 
-Fix the prose findings with the `fix-prose` skill first, on `SQUASH_AGENTMSG mise run lint-squash-msg`. Then run the task yourself:
+Fix the prose findings with the `fix-prose` skill first, on `SQUASH_AGENTMSG bash .agents/skills/merge-pr/scripts/lint-squash-msg.sh <number>`. Then run the wrapper yourself:
 
 ```text
-mise run lint-squash-msg
+bash .agents/skills/merge-pr/scripts/lint-squash-msg.sh <number>
 ```
 
-The same four hooks a commit must pass:
+The workflow wrapper runs the repository's configured `lint-squash-msg` task with the cspell configuration and word list read from the pull request head. It never reads those files from the operator's checkout.
+
+The gate runs the commit hooks along with the source-range identity context that requires `Assisted-by` when the squash collapses an agent commit:
 
 - vale under the commit scope, which catches AI tells through `ai-tells-commits`
 - cspell with the commit dictionary
 - commitlint for the Conventional Commits shape
 - commit-trailers for trailer order
 
-Order matters here. The review in the next step stamps the exact bytes it read, so a lint fix after it voids the stamp and costs another review round over a comma. The merge script runs this task again before it merges, and refuses when the task is absent rather than skipping it.
+Order matters here. The review in the next step stamps the exact bytes it read, so a lint fix after it voids the stamp and costs another review round over a comma. Before merging, the script runs this task again and refuses when the task is absent rather than skipping it.
 
 ## Step 5: review the message
 
@@ -142,13 +144,24 @@ This step is mandatory, and the merge script enforces it.
 | Exit | Meaning |
 | --- | --- |
 | 0 | Passed and stamped |
+| 75 | Waiting for an approving review GitHub requires |
 | 2 | Changes required: the output lists the findings |
+| 3 | The reviewer rejected the same draft for this pull request head. Change it or ask the operator |
 | 4 | The reviewer failed or replied without a readable verdict |
+| 124 | The reviewer timed out without a stamp |
 | 5 | The draft or the pull request moved while the review ran |
 
 Fix everything it returns and run it again. Push back only where it's demonstrably wrong about the commits, and say why.
 
+The script records every readable verdict with the draft digest and pull request head. After `CHANGES REQUIRED`, it refuses to send byte-identical text for the same head to another reviewer. The reviewer can read a changed draft.
+
 A finding cites one instance rather than the fault itself. Fix the instance, then read the rest of the message for the same fault.
+
+`review_cmd` chooses the reviewer. It isn't only a label. From Codex, configure a reviewer that the session may start. These repository machines use `agy` in read-only plan mode through this line in `~/.config/devtools/devtools.conf`:
+
+```text
+review_cmd = agy -p "$(cat)" --mode plan --add-dir "$DEVTOOLS_REVIEW_INPUTS" --print-timeout 900s
+```
 
 `DEVTOOLS_REVIEW_CMD`, `DEVTOOLS_REVIEW_MODEL`, and `DEVTOOLS_REVIEW_EFFORT`, or the same keys in `~/.config/devtools/<repository>.conf`, replace the default reviewer. No repository file can, so a branch never chooses who reviews its own merge.
 
@@ -206,3 +219,7 @@ Report the merged commit. Where this worktree stands on the branch that merged, 
 - the `review-squash-message` skill deployed alongside this one
 
 Preflight checks each. Where one is missing, tell the operator rather than improvising a substitute.
+
+## API quota
+
+Identity and explicit readers use GraphQL, which doesn't spend REST core quota. Each checks snapshot uses one GraphQL call. Quota failures return 76 and print the resource's reset time. Other API failures keep GitHub's error. The watcher returns 2 for ordinary check-read failures. A missing reset header needs one REST `/rate_limit` lookup, which doesn't consume core quota. GitHub CLI writes can still spend REST quota resolving or applying labels, milestones, reviewers, and assignees. Scripts never retry writes automatically.

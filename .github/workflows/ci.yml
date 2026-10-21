@@ -1,11 +1,11 @@
 ---
 # Main quality gate. nastools is a Go project with one binary, so the
 # gates are the full lint bar, the Go tests (coverage threshold plus the
-# race detector, on Linux and macOS), the bats suites for the shell tools,
-# govulncheck, and the vendor-drift check. Every job installs the pinned
-# toolchain through mise and runs its gate through `mise run`, so the mise
-# config stays the single definition of what each gate runs. The local
-# `check` aggregate stays in lockstep with this workflow.
+# race detector, on Linux and macOS), govulncheck, and the vendor-drift
+# check. Every job installs the pinned toolchain through mise and runs its
+# gate through `mise run`, so the mise config stays the single definition of
+# what each gate runs. The local `check` aggregate stays in lockstep with
+# this workflow.
 
 name: ci
 
@@ -49,10 +49,10 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      # Installs every tool the mise config pins -- vendir, go and the
-      # rest from mise.toml, the baseline from the vendored conf.d drop-in
-      # -- at the version and digest recorded in the lockfile beside each
-      # config.
+      # Installs every tool the mise config pins -- vendir and the go:
+      # devtools commands from mise.toml, go and the rest of the baseline
+      # from the vendored conf.d drop-in -- at the version and digest
+      # recorded in the lockfile beside each config.
       - name: Set up the toolchain
         uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
@@ -73,13 +73,6 @@ jobs:
       - name: Sync Vale styles
         run: mise run install-tools
 
-      # guard-markdown backs lint-markdown-wrap. The task installs the
-      # version the devtools pin in apm.yml names.
-      - name: Install guard-markdown
-        run: |
-          mise run install-guard-markdown
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-
       - name: Lint
         run: mise run lint
 
@@ -94,9 +87,6 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         # Scan source commits rather than GitHub's synthetic merge signature.
         run: mise run lint-leaks -- --range "${BASE_SHA}..${HEAD_SHA}"
-
-      - name: Test the shell tools
-        run: mise run test-tools
 
   test-matrix:
     name: "test (${{ matrix.os }})"

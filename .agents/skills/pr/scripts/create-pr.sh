@@ -9,28 +9,49 @@
 # the inside, so every gate runs here and so does the call they gate.
 #
 # Running it a second time updates the open pull request rather than
-# opening another. A description goes stale the moment remediation adds
-# work, and the fix for that is the same path that published it, so the
-# same gates apply to the rewrite.
+# opening another, and brings its title, body, base, labels, reviewers,
+# assignees, milestone, and draft state to what the draft says. A
+# description goes stale the moment remediation adds work, and the fix
+# for that is the same path that published it, so the same gates apply
+# to the rewrite.
+#
+# In order, it refuses unless: the draft exists, no rebase, merge, or
+# cherry-pick is under way, the branch is neither detached nor the base,
+# the validator passes, the review stamp covers the draft's bytes, HEAD,
+# the resolved base ref, that ref's commit, and the merge base, gh can
+# resolve every label, the milestone, and every #N the description
+# cites, the push would be a fast-forward (or --rewrite allows the one
+# rewrite it can make safely), and somebody confirmed the publish (the
+# operator flag, a pre-approval for this session, or the machine's
+# delegation check). The confirmation is another program, so the stamp
+# is checked again after it, and then gh has to be signed in as the
+# configured agent account. Everything published comes from this
+# script's own copy of the stamped bytes.
+#
+# The push is a fast-forward of what origin holds, read from origin
+# itself with git ls-remote. A branch rebased after its last push goes
+# up only with --rewrite, which leases on that exact remote commit, and
+# refuses when HEAD is behind origin or when origin holds a commit this
+# checkout never fetched. After the push, HEAD has to still be the
+# reviewed commit and origin has to hold it.
 #
 # The draft outlives this script. PR_AGENTDESC.md stays the working copy
 # of the description for as long as the pull request is open, and the
 # merge-pr skill removes it once the branch lands.
 #
-# The order matters. Everything that can fail offline fails before the
-# branch is pushed, everything that needs the API is resolved before the
-# pull request changes, and the draft survives every failure so a retry
-# starts from the text that was already written.
-#
-# Written to bash 3.2 so it runs on a stock macOS shell.
+# Usage: create-pr.sh [--confirmed] [--rewrite] [--dry-run] [--check-description] [--rerun-gates]
+#   --confirmed  the operator answered yes to this publish in this session
+#   --rewrite    the branch was rebased on purpose: replace origin's copy
+#   --dry-run    run every check, say what the push would do, and stop
+#                before confirming, pushing, or publishing anything
+# Exit:  0 published (or the dry run passed), 1 refused, 75 held:
+#        nobody has confirmed the publish; ask, then pass --confirmed
+# shellcheck disable=SC2034,SC2154 # publication and properties are sourced below
 set -euo pipefail
 
 # --- environment hardening -------------------------------------------
-# The agent reads this output, so the operator's preferences must not
-# change its shape. LC_ALL pins collation, because sort and the [a-z]
-# ranges below mean different things under a UTF-8 locale. The unsets
-# cover variables that silently retarget a command: GH_REPO sends gh at
-# another repository, CDPATH makes a relative cd print somewhere else.
+# lib.sh repeats this block; it stays here too so the hygiene gate can
+# see it in the file that calls git and gh.
 export LC_ALL=C
 export GH_PAGER=cat
 export GH_PROMPT_DISABLED=1
@@ -38,14 +59,12 @@ export PYTHONUTF8=1
 unset CDPATH GH_REPO GH_HOST GREP_OPTIONS
 IFS=$' \t\n'
 
-readonly DRAFT=PR_AGENTDESC.md
-
-root=$(git rev-parse --show-toplevel)
-cd "$root"
-git_dir=$(git rev-parse --absolute-git-dir)
-readonly STAMP="$git_dir/codex-pr-agentdesc.reviewed"
-
-here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck disable=SC1091 # lib.sh is generated beside this script
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck disable=SC1091 # description.sh is deployed beside this script
+. "$DT_LIB_DIR/description.sh"
+# shellcheck disable=SC1091 # unattended behavior shares these entry points
+. "$DT_LIB_DIR/pr-agent.sh"
 
 die() {
   printf 'create-pr: %s\n' "$1" >&2
@@ -54,225 +73,116 @@ die() {
 
 step() { printf '\n--- %s\n' "$1"; }
 
-[ -s "$DRAFT" ] || die "no draft at ${DRAFT}. Draft the description first."
+usage="usage: create-pr.sh [--confirmed] [--rewrite] [--dry-run] [--check-description] [--rerun-gates]"
+confirmed=false
+rewrite=false
+dry_run=false
+check_description=false
+rerun_gates=false
+for arg in "$@"; do
+  case $arg in
+  --confirmed) confirmed=true ;;
+  --rewrite) rewrite=true ;;
+  --dry-run) dry_run=true ;;
+  --check-description) check_description=true ;;
+  --rerun-gates) rerun_gates=true ;;
+  *) die "$usage" ;;
+  esac
+done
 
-# --- gate 1: the mechanical checks -----------------------------------
+if [ "${DT_UNATTENDED:-0}" = 1 ] && [ "$confirmed" = true ]; then
+  die "Unattended workflows refuse --confirmed; use pre-approval or delegation."
+fi
+root=$(dt_root)
+cd "$root"
+git_dir=$(dt_git_dir)
+state=$(dt_state_dir)
+here=$DT_LIB_DIR
+draft=$root/PR_AGENTDESC.md
+pr_agent_context
 
-step "validating ${DRAFT}"
-bash "$here/validate-description.sh" "$DRAFT" ||
-  die "the description does not satisfy the template. Fix the findings above and retry."
-printf 'clean\n'
+[ -s "$draft" ] || die "no draft at PR_AGENTDESC.md. Draft the description first."
+if [ -d "$git_dir/rebase-merge" ] || [ -d "$git_dir/rebase-apply" ] ||
+  [ -f "$git_dir/MERGE_HEAD" ] || [ -f "$git_dir/CHERRY_PICK_HEAD" ]; then
+  die "a rebase, merge, or cherry-pick is in progress. Finish or abort it first:
+a pull request published now would carry a branch the review never saw."
+fi
+branch=$(gitr symbolic-ref -q --short HEAD) || die "HEAD is detached. Check out the branch to publish."
+base=$(pr_field "$draft" base)
+[ -n "$base" ] || die "the draft's frontmatter carries no base."
+[ "$branch" != "$base" ] || die "${branch} is the base branch. Publish a topic branch."
+base_ref=$(pr_base_ref "$base")
+pr_agent_range "$base_ref"
+[ -n "$base_ref" ] || die "the draft's base, ${base}, names no local or origin branch."
+
+check_identity() {
+  local want login
+  want=$(dt_conf gh_login)
+  [ "${DT_UNATTENDED:-0}" != 1 ] || [ -n "$want" ] || die "gh_login must be configured on the machine"
+  if [ -z "$want" ]; then
+    printf 'gh identity: gh_login is not configured, so the account check is skipped\n'
+    return 0
+  fi
+  login=$(dt_gh_login) || exit $?
+  [ "$login" = "$want" ] ||
+    die "gh is signed in as ${login:-nobody}, not ${want}. Nothing was pushed or published."
+  printf 'gh identity: %s\n' "$login"
+}
+
+check_identity
+
+# Cheap description checks precede scans, review, and tests.
+step "validating PR_AGENTDESC.md"
+pr_checks "$draft" "$rerun_gates"
 
 # --- gate 2: the independent review ----------------------------------
 #
-# The independent reviewer records the digest explicitly after a PASS.
-# Comparing that digest against the draft on disk makes an edit after
-# review read as unreviewed.
+# The stamp has to match everything the review read: the draft's bytes,
+# the branch, the base as it was resolved then, and where the two meet.
+# A fetch that moved origin's copy of the base voids it as surely as a
+# new commit on the branch does.
 
-step "checking the review signature"
-digest() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | cut -d' ' -f1
-  else
-    shasum -a 256 "$1" | cut -d' ' -f1
-  fi
+require_reviewed() {
+  [ -f "$state/pr.stamp" ] || die "no independent review has cleared this draft. Run it:
+
+  bash $here/review.sh"
+  local now_ref now_oid now_base now_head now_mergebase now_branch
+  now_base=$(pr_field "$draft" base) || return $?
+  now_ref=$(pr_base_ref "$now_base") || return $?
+  now_head=$(dt_head) || return $?
+  now_branch=$(gitr symbolic-ref --short HEAD) || return $?
+  now_oid=$(gitr rev-parse --verify --quiet "${now_ref:-none}^{commit}" || printf 'none\n')
+  now_mergebase=$(gitr merge-base "$now_oid" HEAD 2>/dev/null || printf 'none\n') || return $?
+  (dt_require_stamp pr "$draft" head "$now_head" base "$now_ref" base_oid "$now_oid" \
+    mergebase "$now_mergebase" branch "$now_branch") ||
+    die "the reviewed description and branch are no longer what would publish.
+Review it again against the current draft, branch, and base:
+
+  bash $here/review.sh"
 }
 
-[ -f "$STAMP" ] ||
-  die "review-pr-description has not cleared this draft. Invoke that skill, resolve
-what it returns, then retry."
-
-[ "$(awk '{ print $1 }' "$STAMP")" = "$(digest "$DRAFT")" ] ||
-  die "${DRAFT} changed after review-pr-description signed off. Review it again."
-[ "$(awk '{ print $2 }' "$STAMP")" = "$(git rev-parse HEAD)" ] ||
-  die "the branch changed after review-pr-description signed off. Review it again."
-reviewed_base=$(sed -n 's/^base:[[:space:]]*//p' "$DRAFT" | head -1)
-[ -n "$reviewed_base" ] || die "the draft carries no base branch"
-[ "$(awk '{ print $3 }' "$STAMP")" = "$(git rev-parse "$reviewed_base")" ] ||
-  die "the base branch changed after review-pr-description signed off. Review it again."
-printf 'signed\n'
-
-# --- parse the draft -------------------------------------------------
-
-# The frontmatter shape is the one validate-description.sh enforces, so
-# this parser can stay line-based rather than pulling in a YAML reader.
-fm_end=$(awk 'NR > 1 && $0 == "---" { print NR; exit }' "$DRAFT")
-[ -n "$fm_end" ] || die "the frontmatter never closes with ---"
-
-field() {
-  awk -v key="$1" -v last="$fm_end" '
-    NR >= last { exit }
-    index($0, key ":") == 1 {
-      value = substr($0, length(key) + 2)
-      sub(/^[ \t]+/, "", value)
-      print value
-      exit
-    }
-  ' "$DRAFT"
-}
-
-# sequence prints one entry per line from a YAML flow sequence.
-sequence() {
-  printf '%s' "$1" | sed 's/^\[//; s/\]$//' | tr ',' '\n' |
-    sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//' |
-    grep -v '^$' || true
-}
-
-base=$(field base)
-is_draft=$(field draft)
-labels=$(sequence "$(field labels)")
-reviewers=$(sequence "$(field reviewers)")
-assignees=$(sequence "$(field assignees)")
-milestone=$(field milestone)
-
-title=$(awk 'NR > '"$fm_end"' && /^# / { print substr($0, 3); exit }' "$DRAFT")
-[ -n "$title" ] || die "the draft carries no level 1 heading to use as the title"
-
-# The body is everything after the title line. GitHub renders the title
-# itself, and the frontmatter is this workflow's own bookkeeping, so
-# neither belongs in what gets published.
-title_line=$(awk 'NR > '"$fm_end"' && /^# / { print NR; exit }' "$DRAFT")
-body_file="$git_dir/pr-agentdesc-body.md"
-awk -v start="$title_line" 'NR > start' "$DRAFT" |
-  awk 'NF { found = 1 } found' >"$body_file"
-
-[ -s "$body_file" ] || die "the description has a title but no body"
-
-# --- gate 3: resolve everything the API has to recognize -------------
-#
-# gh adds labels, reviewers, and the milestone after the pull request
-# exists. An unknown one therefore fails *after* creation, leaving a
-# published pull request missing the properties it was supposed to
-# carry. Resolving them first turns that into a clean refusal.
-
-step "resolving pull request properties"
-command -v gh >/dev/null 2>&1 || die "gh is not installed"
-gh auth status >/dev/null 2>&1 || die "gh is not authenticated. Run gh auth login."
-
-known_labels=$(gh label list --limit 200 --json name --jq '.[].name' 2>/dev/null || true)
-while IFS= read -r want; do
-  [ -n "$want" ] || continue
-  printf '%s\n' "$known_labels" | grep -qxF "$want" ||
-    die "no label named \"${want}\" in this repository. Preflight printed the label set."
-done <<EOF
-$labels
-EOF
-
-if [ -n "$milestone" ]; then
-  known_milestones=$(gh api 'repos/{owner}/{repo}/milestones' --jq '.[].title' 2>/dev/null || true)
-  printf '%s\n' "$known_milestones" | grep -qxF "$milestone" ||
-    die "no milestone named \"${milestone}\" in this repository."
-fi
-
-# Every issue or pull request the description points at has to exist. A
-# reference to a number nobody opened is the cheapest kind of invented
-# claim, and it is the one a machine can settle.
-refs=$(grep -o '#[0-9][0-9]*' "$body_file" | sort -u | head -20 || true)
-for ref in $refs; do
-  number=${ref#\#}
-  gh api "repos/{owner}/{repo}/issues/${number}" --jq '.number' >/dev/null 2>&1 ||
-    die "the description references ${ref}, which is not an issue or pull request here."
-done
-printf 'labels, milestone, and references all resolve\n'
-
-# --- push ------------------------------------------------------------
-
-branch=$(git rev-parse --abbrev-ref HEAD)
-open_number=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number' 2>/dev/null || true)
-step "pushing ${branch}"
-if [ -n "$open_number" ]; then
-  git push --force-with-lease origin "HEAD:${branch}"
-elif git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
-  git push origin "HEAD:${branch}"
-else
-  git push --set-upstream origin "HEAD:${branch}"
-fi
-
-# --- publish ---------------------------------------------------------
-
-if [ -n "$open_number" ]; then
-  step "updating pull request #${open_number}"
-  state=$(gh pr view "$open_number" \
-    --json baseRefName,isDraft,labels,reviewRequests,assignees,milestone)
-  gh pr edit "$open_number" --base "$base" --title "$title" --body-file "$body_file"
-
-  reconcile() {
-    add_flag=$1
-    remove_flag=$2
-    desired=$3
-    current=$4
-    while IFS= read -r item; do
-      [ -n "$item" ] || continue
-      printf '%s\n' "$desired" | grep -qxF "$item" ||
-        gh pr edit "$open_number" "$remove_flag" "$item" >/dev/null
-    done <<EOF
-$current
-EOF
-    while IFS= read -r item; do
-      [ -n "$item" ] || continue
-      printf '%s\n' "$current" | grep -qxF "$item" ||
-        gh pr edit "$open_number" "$add_flag" "$item" >/dev/null
-    done <<EOF
-$desired
-EOF
-  }
-
-  reconcile --add-label --remove-label "$labels" \
-    "$(printf '%s' "$state" | jq -r '.labels[].name')"
-  reconcile --add-reviewer --remove-reviewer "$reviewers" \
-    "$(printf '%s' "$state" | jq -r '.reviewRequests[].login')"
-  reconcile --add-assignee --remove-assignee "$assignees" \
-    "$(printf '%s' "$state" | jq -r '.assignees[].login')"
-
-  if [ -n "$milestone" ]; then
-    gh pr edit "$open_number" --milestone "$milestone" >/dev/null
-  elif [ "$(printf '%s' "$state" | jq -r '.milestone.title // empty')" ]; then
-    gh pr edit "$open_number" --remove-milestone >/dev/null
-  fi
-  current_draft=$(printf '%s' "$state" | jq -r '.isDraft')
-  if [ "$is_draft" = true ] && [ "$current_draft" = false ]; then
-    gh pr ready "$open_number" --undo >/dev/null
-  elif [ "$is_draft" = false ] && [ "$current_draft" = true ]; then
-    gh pr ready "$open_number" >/dev/null
-  fi
-  gh pr view "$open_number" --json url --jq '.url'
-  rm -f "$body_file"
-  step "done"
-  printf 'description updated. %s stays for the next edit.\n' "$DRAFT"
+# shellcheck disable=SC1091 # shares the draft and publication properties
+. "$here/properties.sh"
+if [ "$check_description" = true ]; then
+  rm -f "$copy" "$body_file"
   exit 0
 fi
+require_reviewed
 
-step "opening the pull request"
-set -- --base "$base" --title "$title" --body-file "$body_file"
-if [ "$is_draft" = true ]; then
-  set -- "$@" --draft
-fi
-while IFS= read -r item; do
-  [ -n "$item" ] || continue
-  set -- "$@" --label "$item"
-done <<EOF
-$labels
-EOF
-while IFS= read -r item; do
-  [ -n "$item" ] || continue
-  set -- "$@" --reviewer "$item"
-done <<EOF
-$reviewers
-EOF
-while IFS= read -r item; do
-  [ -n "$item" ] || continue
-  set -- "$@" --assignee "$item"
-done <<EOF
-$assignees
-EOF
-if [ -n "$milestone" ]; then
-  set -- "$@" --milestone "$milestone"
-fi
+mise run devtools:lint-leaks
+mise run devtools:gitleaks
+dt_gate lint "" "$rerun_gates" mise run lint
+DT_UNATTENDED=${DT_UNATTENDED:-0} bash "$here/review.sh"
+step "checking the review stamp"
+require_reviewed
+head=$(dt_head)
+copy_digest=$(dt_digest "$copy") || exit $?
+reviewed_digest=$(dt_stamp_value pr draft) || exit $?
+[ "$copy_digest" = "$reviewed_digest" ] ||
+  die "PR_AGENTDESC.md changed while it was being copied. Review it again."
+printf 'stamped for %s on %s\n' "$head" "$base_ref"
 
-url=$(gh pr create "$@")
-printf '%s\n' "$url"
+dt_gate test "" "$rerun_gates" mise run test
 
-rm -f "$body_file"
-
-step "done"
-printf 'pull request open. %s stays until merge-pr lands the branch.\n' "$DRAFT"
+# shellcheck disable=SC1091 # publication shares the checked state above
+. "$here/publish.sh"

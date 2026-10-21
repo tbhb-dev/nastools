@@ -39,13 +39,13 @@ none() { printf '(none)\n'; }
 
 root=$(dt_root)
 cd "$root"
+bash "$(dirname "${BASH_SOURCE[0]}")/worktree-ready.sh"
+ma_context
 
 section "gh"
 gh_state=ok
 if ! command -v gh >/dev/null 2>&1; then
   gh_state="gh is not installed"
-elif ! gh auth status >/dev/null 2>&1; then
-  gh_state="gh is not authenticated — run gh auth login"
 elif ! command -v jq >/dev/null 2>&1; then
   gh_state="jq is not installed"
 fi
@@ -55,10 +55,12 @@ if [ "$gh_state" != ok ]; then
   exit 0
 fi
 
+login=$(dt_gh_login) || exit $?
+
 branch=$(gitr rev-parse --abbrev-ref HEAD)
 number=${1:-}
 if [ -z "$number" ]; then
-  number=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+  number=$(dt_gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty') || exit $?
 fi
 
 section "target"
@@ -67,18 +69,15 @@ if [ -z "$number" ]; then
   printf 'pull request: NONE for this branch, and none given.\n'
   printf 'Pass the number as the skill argument, or open one with the pr skill.\n'
   printf '\nopen pull requests here:\n'
-  gh pr list --state open --limit 20 --json number,title,author,isDraft \
-    --jq '.[] | "#\(.number) \(.title) (\(.author.login))" + (if .isDraft then " [draft]" else "" end)' 2>/dev/null || none
+  dt_gh pr list --state open --limit 20 --json number,title,author,isDraft \
+    --jq '.[] | "#\(.number) \(.title) (\(.author.login))" + (if .isDraft then " [draft]" else "" end)' || exit $?
   exit 0
 fi
 printf 'pull request: #%s\n' "$number"
 
 view=$(dt_state_dir)/merge-preflight.json
-if ! mp_view "$number" "$view" \
-  number,title,state,isDraft,author,baseRefName,headRefName,headRefOid,isCrossRepository,mergeable,mergeStateStatus,reviewDecision,url,statusCheckRollup,commits,body,files 2>/dev/null; then
-  printf '(could not read #%s)\n' "$number"
-  exit 0
-fi
+mp_view "$number" "$view" \
+  "$MA_GATE_FIELDS,number,title,author,headRefName,isCrossRepository,reviewDecision,url,commits,body,files" || exit $?
 
 section "state"
 jq -r '
@@ -91,6 +90,13 @@ jq -r '
   "review decision: " + (if (.reviewDecision // "") == "" then "(none required)" else .reviewDecision end),
   "url: \(.url)"
 ' "$view"
+
+mp_require_reviews "$view" "$number"
+if [ "${DT_UNATTENDED:-0}" = 1 ]; then
+  pinned_base=$(mp_field "$view" baseRefName)
+  pinned_base=$(mp_base_oid "$pinned_base")
+  ma_gates "$view" "$number" "$pinned_base"
+fi
 
 section "checks"
 status=0
@@ -114,6 +120,7 @@ else
 fi
 
 section "commits being collapsed"
+# shellcheck disable=SC2312 # Only formats diagnostic output; no decision uses the status.
 printf 'count: %s\n\n' "$(jq -r '.commits | length' "$view")"
 jq -r '.commits[] | "--- " + .oid[0:7] + "\n" + .messageHeadline + "\n" + (.messageBody // "")' "$view" |
   head -n "$((COMMIT_CAP * 8))" || true
@@ -129,7 +136,6 @@ rm -f "$view"
 # refuses one made from any account but the configured one.
 section "identity"
 want_login=$(dt_conf gh_login)
-login=$(gh api user --jq .login 2>/dev/null || true)
 if [ -z "$want_login" ]; then
   printf 'gh account: %s; gh_login is not configured, so the merge does not check it\n' "${login:-unknown}"
 elif [ "$login" = "$want_login" ]; then
@@ -147,14 +153,15 @@ fi
 # machine's delegation_check, reported here as configured rather than
 # called, because asking it is the merge's job.
 section "pre-approval"
-if [ -n "$(dt_session_id)" ] && grant=$(dt_preapproval merge); then
+session=$(dt_session_id) || exit $?
+if [ -n "$session" ] && grant=$(dt_preapproval merge); then
   case ${grant##* } in
   touchid) how="a Touch ID prompt stands behind it" ;;
   *) how="no biometric prompt stood behind it" ;;
   esac
   printf 'merge: GRANTED, %s — step 6 skips the confirmation once every gate and the review pass\n' "$how"
 else
-  printf 'merge: not granted — step 6 confirms with the operator as written\n'
+  printf 'merge: not granted — merge holds until an authority grants it\n'
 fi
 checker=$(dt_conf delegation_check)
 if [ -n "$checker" ]; then
@@ -164,9 +171,13 @@ else
 fi
 
 section "review"
+# shellcheck disable=SC2312 # Only formats diagnostic output; no decision uses the status.
 printf 'harness:  %s\n' "$(dt_harness)"
+# shellcheck disable=SC2312 # Only formats diagnostic output; no decision uses the status.
 printf 'reviewer: %s\n' "$(dt_reviewer_label)"
-if [ -f "$(dt_state_dir)/squash.stamp" ]; then
+state=$(dt_state_dir) || exit $?
+if [ -f "$state/squash.stamp" ]; then
+  # shellcheck disable=SC2312 # Only formats diagnostic output; no decision uses the status.
   printf 'stamp:    present for #%s from an earlier review; review.sh replaces it\n' \
     "$(dt_stamp_value squash pr)"
 else
@@ -179,7 +190,11 @@ if git check-ignore --quiet "$DRAFT" 2>/dev/null; then
 else
   printf '%s gitignored: NO — add it to .gitignore before drafting\n' "$DRAFT"
 fi
-if command -v mise >/dev/null 2>&1 && mise task info lint-squash-msg >/dev/null 2>&1; then
+if [ "${DT_UNATTENDED:-0}" = 1 ]; then
+  configured_lint=$(dt_repo_conf lint_squash_cmd 'mise run lint-squash-msg')
+  [ -n "$configured_lint" ] || dt_die "lint_squash_cmd must not be empty"
+  printf 'configured squash lint: %s\n' "$configured_lint"
+elif command -v mise >/dev/null 2>&1 && mise task info lint-squash-msg >/dev/null 2>&1; then
   printf 'mise run lint-squash-msg: present\n'
 else
   printf 'mise run lint-squash-msg: ABSENT — stop and tell the operator\n'

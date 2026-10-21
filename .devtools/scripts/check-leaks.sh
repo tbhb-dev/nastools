@@ -63,7 +63,8 @@ export LC_ALL=C
 exec 3>&2
 
 # git runs quietly: its own messages can repeat a path or a ref.
-git() { command git "$@" 2>/dev/null; }
+# Bash 3.2 applies errexit to `command` even when the caller tests its status.
+git() { env git "$@" 2>/dev/null; }
 
 # Repository-owned ERE allow list: patterns only, never private literals.
 # Read relative to the repository root in every mode.
@@ -134,7 +135,6 @@ if ((loaded == 0)); then
   msg="no private values loaded (*_PRIVATE_STRINGS unset); only the publishable patterns are checked, so a host name, login or path outside those shapes passes"
   # On a machine that has the settings file, the values just didn't reach
   # this process. Say so, because that is a local setup mistake, not CI.
-  top=$(git rev-parse --show-toplevel || true)
   if [[ -n $top && -f $top/mise.local.toml ]]; then
     msg="$msg. mise.local.toml exists here but its values are not in the environment; run the check through mise (mise run devtools:lint-leaks) so it can read them"
   fi
@@ -183,7 +183,7 @@ scan() {
       }
       if (r < 0) unreadable = 1
       close(pf)
-      exempt = ENVIRON["PATTERN_EXEMPT"]
+      exempt = "^\\.devtools/scripts/check-leaks\\.bats$|" ENVIRON["PATTERN_EXEMPT"]
       for (i = 1; i < 256; i++) ord[sprintf("%c", i)] = i
       # Split so a search for the literal finds only real uses of it.
       op_ref = "op:" "//"
@@ -305,16 +305,12 @@ emit_file() {
   emit_body "$2"
 }
 
-# emit_blob LABEL OBJECT: a blob as a file.
-emit_blob() {
-  git cat-file blob "$2" >"$tmp/blob"
-  emit_file "$1" "$tmp/blob"
-}
-
 emit_tree() {
-  local f
+  local f tree_skip
+  load_leak_skip
   git ls-files -z --cached --others --exclude-standard >"$tmp/list"
   while IFS= read -r -d '' f; do
+    [[ $f =~ $tree_skip ]] && continue
     if [[ -f $f && ! -L $f ]]; then
       emit_file "$f" "$f"
     elif [[ -L $f ]]; then
@@ -347,7 +343,8 @@ emit_raw() {
       continue
     fi
     if [[ $2 == content ]]; then
-      emit_blob "$p" "${m[3]}"
+      git cat-file blob "${m[3]}" >"$tmp/blob"
+      emit_file "$p" "$tmp/blob"
     else
       emit_path "$p"
     fi
@@ -411,7 +408,7 @@ emit_objects() {
       close(file)
     }
     BEGIN {
-      exempt = ENVIRON["PATTERN_EXEMPT"]
+      exempt = "^\\.devtools/scripts/check-leaks\\.bats$|" ENVIRON["PATTERN_EXEMPT"]
       load(ENVIRON["TYPES"], "types")
       load(ENVIRON["PAIRS"], "paths")
       load(ENVIRON["NAMES"], "paths")
@@ -545,6 +542,9 @@ while (($#)); do
   shift
 done
 
+script_dir=$(dirname "${BASH_SOURCE[0]}")
+# shellcheck source=.devtools/scripts/leak-skip.sh
+if [[ $mode == tree ]]; then source "$script_dir/leak-skip.sh"; fi
 if [[ $mode != files ]]; then
   top=$(git rev-parse --show-toplevel)
   cd "$top"

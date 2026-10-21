@@ -34,6 +34,10 @@ IFS=$' \t\n'
 # shellcheck disable=SC1091 # lib.sh is generated beside this script
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+bash "$(dirname "${BASH_SOURCE[0]}")/worktree-ready.sh"
+
 # Diff budget. The full patch is worth inlining when it is small enough
 # to read, and actively harmful when it is not: an oversized paste
 # crowds out the rest of the skill. Past the cap the report prints the
@@ -53,6 +57,11 @@ readonly FOOTER_MAX=${COMMITLINT_FOOTER_MAX_LINE_LENGTH:-100}
 readonly TYPES=${COMMITLINT_TYPES:-"feat fix docs style refactor perf test build ci chore revert"}
 
 section() { printf '\n== %s ==\n' "$1"; }
+
+command -v commit-lint >/dev/null 2>&1 || {
+  printf 'commit preflight: commit-lint is not installed; add "go:github.com/tbhb-dev/devtools/cmd/commit-lint" = "<devtools-version>" to mise.toml [tools]\n' >&2
+  exit 1
+}
 
 # none prints a placeholder when a listing came back empty, so a section
 # never reads as truncated output.
@@ -96,8 +105,10 @@ behind_count() {
   printf '%s\n' "${counts%%[[:space:]]*}"
 }
 
-root=$(git rev-parse --show-toplevel)
-cd "$root"
+if [ "${DT_UNATTENDED:-0}" = 1 ]; then
+  dt_agent_context
+  dt_agent_signing
+fi
 # symbolic-ref rather than rev-parse: before the first commit HEAD names
 # a branch that does not exist yet, and rev-parse fails on it.
 branch=$(git symbolic-ref --quiet --short HEAD || printf 'detached\n')
@@ -159,10 +170,13 @@ if [ "$DO_FETCH" = "1" ]; then
 fi
 printf 'fetch:  %s\n' "$fetch_state"
 printf 'default branch: %s\n' "$default_branch"
+# shellcheck disable=SC2312 # Only formats diagnostic output; no decision uses the status.
 printf '%s vs origin/%s:  %s\n' "$default_branch" "$default_branch" \
   "$(ahead_behind "refs/heads/$default_branch" "refs/remotes/origin/$default_branch")"
+# shellcheck disable=SC2312 # Only formats diagnostic output; no decision uses the status.
 printf '%s vs %s:  %s\n' "$branch" "$default_branch" \
   "$(ahead_behind HEAD "refs/heads/$default_branch")"
+# shellcheck disable=SC2312 # Only formats diagnostic output; no decision uses the status.
 printf '%s vs origin/%s:  %s\n' "$branch" "$default_branch" \
   "$(ahead_behind HEAD "refs/remotes/origin/$default_branch")"
 
@@ -205,7 +219,11 @@ if git check-ignore --quiet COMMIT_AGENTMSG 2>/dev/null; then
 else
   printf 'COMMIT_AGENTMSG gitignored: NO — add it to .gitignore before drafting\n'
 fi
-if command -v mise >/dev/null 2>&1 && mise task info lint-commit-msg >/dev/null 2>&1; then
+if [ "${DT_UNATTENDED:-0}" = 1 ]; then
+  lint_cmd=$(dt_repo_conf lint_commit_cmd 'mise run lint-commit-msg')
+  [ -n "$lint_cmd" ] || dt_die "lint_commit_cmd must not be empty"
+  printf 'commit message gate: %s\n' "$lint_cmd"
+elif command -v mise >/dev/null 2>&1 && mise task info lint-commit-msg >/dev/null 2>&1; then
   printf 'mise run lint-commit-msg: present\n'
 else
   printf 'mise run lint-commit-msg: ABSENT — stop and tell the operator\n'
@@ -223,6 +241,7 @@ for hook in commit-msg pre-commit post-commit; do
   fi
 done
 if [ -s COMMIT_AGENTMSG ]; then
+  # shellcheck disable=SC2312 # Only formats diagnostic output; no decision uses the status.
   printf 'COMMIT_AGENTMSG: present, %s line(s) — a leftover draft; overwrite it\n' \
     "$(wc -l <COMMIT_AGENTMSG | tr -d ' ')"
 else
@@ -243,6 +262,8 @@ if [ -n "$session" ] && grant=$(dt_preapproval commit); then
   *) how="no biometric prompt stood behind it" ;;
   esac
   printf 'commit: GRANTED, %s — step 8 skips the confirmation once every gate and the review pass\n' "$how"
+elif [ "${DT_UNATTENDED:-0}" = 1 ]; then
+  printf 'commit: not granted; delegation must authorize the write, otherwise report the hold\n'
 else
   printf 'commit: not granted — step 8 confirms with the operator as written\n'
 fi
@@ -254,9 +275,12 @@ else
 fi
 
 section "review"
+# shellcheck disable=SC2312 # Only formats diagnostic output; no decision uses the status.
 printf 'harness:  %s\n' "$(dt_harness)"
+# shellcheck disable=SC2312 # Only formats diagnostic output; no decision uses the status.
 printf 'reviewer: %s\n' "$(dt_reviewer_label)"
-if [ -f "$(dt_git_dir)/agent-skills/commit.stamp" ]; then
+git_dir=$(dt_git_dir) || exit $?
+if [ -f "$git_dir/agent-skills/commit.stamp" ]; then
   printf 'stamp:    present from an earlier review; review.sh replaces it\n'
 else
   printf 'stamp:    none\n'
@@ -287,6 +311,7 @@ patch=$(
   gitr diff --no-ext-diff --cached
   gitr diff --no-ext-diff
 )
+# shellcheck disable=SC2312 # Only formats diagnostic output; no decision uses the status.
 if [ -z "$patch" ]; then
   printf '(no tracked changes)\n'
 elif [ "$(printf '%s\n' "$patch" | wc -l)" -le "$DIFF_LINE_CAP" ]; then
@@ -308,6 +333,5 @@ printf 'subject: %s to %s chars, imperative mood, no trailing period\n' "$HEADER
 printf 'body:    hard wrap at %s chars\n' "$BODY_MAX"
 printf 'footer:  wrap at %s chars\n' "$FOOTER_MAX"
 printf 'trailers: Assisted-by before Signed-off-by; Signed-off-by required\n'
-signoff_name=$(git config --get user.name || echo UNSET)
-signoff_email=$(git config --get user.email || echo UNSET)
-printf 'Signed-off-by: %s <%s>\n' "$signoff_name" "$signoff_email"
+signoff_identity=$(dt_signoff_identity) || exit $?
+printf 'Signed-off-by: %s\n' "$signoff_identity"
