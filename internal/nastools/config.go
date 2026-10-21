@@ -7,6 +7,7 @@ package nastools
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -125,6 +126,7 @@ type Operations interface {
 	ReadFile(path string) ([]byte, error)
 	GitState(ctx context.Context, dir string) (GitState, error)
 	Compose(ctx context.Context, args, env []string, out, errOut io.Writer) error
+	Remote(ctx context.Context, argv []string, out, errOut io.Writer) error
 	Open(ctx context.Context, ssh SSH, env map[string]string) (string, error)
 	Lock(ctx context.Context, path string) error
 	Pause(ctx context.Context) error
@@ -198,6 +200,9 @@ func Prepare(ctx context.Context, ops Operations, path string, c Config, env map
 	if err != nil {
 		return Inputs{}, fmt.Errorf("git: %w", ErrInvalid)
 	}
+	// Provenance travels in the Compose environment: a compose file references
+	// ${NASTOOLS_COMMIT} in a service label, so Compose owns applying it.
+	child["NASTOOLS_COMMIT"] = state.Label()
 	return Inputs{Config: c, Dir: dir, Env: childEnvironment(child), Commit: state.Label()}, nil
 }
 
@@ -276,6 +281,7 @@ const (
 	CheckName = "check"
 	Deploy    = "deploy"
 	Logs      = "logs"
+	Status    = "status"
 )
 
 var ErrBusy = errors.New("deploy in progress")
@@ -332,6 +338,65 @@ func Execute(ctx context.Context, ops Operations, path string, env map[string]st
 			return err
 		}
 	}
+	return command.report(ctx, ops, inputs, out, errOut)
+}
+
+// report runs after Compose has succeeded. A Serve failure leaves the stack up.
+func (command Command) report(ctx context.Context, ops Operations, inputs Inputs, out, errOut io.Writer) error {
+	if command.Name == Deploy {
+		if err := publish(ctx, ops, inputs.Config.Serve, out, errOut); err != nil {
+			return err
+		}
+	}
+	if command.Name != Deploy && command.Name != Status {
+		return nil
+	}
+	if err := compose(ctx, ops, inputs, []string{"ps"}, out, errOut); err != nil {
+		return err
+	}
+	return serveStatus(ctx, ops, inputs.Config.Serve, out, errOut)
+}
+
+// publish applies each declared endpoint. Re-running a Serve command with the
+// same flags is idempotent, and the flags scope each command to one Service ID.
+func publish(ctx context.Context, ops Operations, endpoints []Endpoint, out, errOut io.Writer) error {
+	for _, e := range endpoints {
+		port := "--https=" + strconv.Itoa(e.HTTPS)
+		if e.TCP > 0 {
+			port = "--tcp=" + strconv.Itoa(e.TCP)
+		}
+		argv := []string{"tailscale", "serve", "--service=" + e.Service, port, e.Target}
+		if ops.Remote(ctx, argv, out, errOut) != nil {
+			return fmt.Errorf("serve: %w", ErrInvalid)
+		}
+	}
+	return nil
+}
+
+// serveStatus prints the Serve status of the declared Service IDs only.
+func serveStatus(ctx context.Context, ops Operations, endpoints []Endpoint, out, errOut io.Writer) error {
+	if len(endpoints) == 0 {
+		return nil
+	}
+	var raw bytes.Buffer
+	var status struct {
+		Services map[string]json.RawMessage `json:"Services"`
+	}
+	if ops.Remote(ctx, []string{"tailscale", "serve", "status", "--json"}, &raw, errOut) != nil ||
+		json.Unmarshal(raw.Bytes(), &status) != nil {
+		return fmt.Errorf("serve status: %w", ErrInvalid)
+	}
+	scoped := make(map[string]json.RawMessage)
+	for _, e := range endpoints {
+		if service, ok := status.Services[e.Service]; ok {
+			scoped[e.Service] = service
+		}
+	}
+	encoder := json.NewEncoder(out)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(scoped); err != nil {
+		return fmt.Errorf("serve status: %w", ErrInvalid)
+	}
 	return nil
 }
 
@@ -341,10 +406,8 @@ func (command Command) arguments(wait int) [][]string {
 		return [][]string{
 			{"pull", "--ignore-buildable"},
 			{"up", "--wait", "--wait-timeout", strconv.Itoa(wait), "--remove-orphans"},
-			{"ps"},
 		}
-	// F3 inserts provenance before pull and scoped Serve after readiness.
-	case "logs":
+	case Logs:
 		args := []string{"logs", "--tail", strconv.Itoa(command.Tail)}
 		if command.Follow {
 			args = append(args, "--follow")
@@ -354,7 +417,7 @@ func (command Command) arguments(wait int) [][]string {
 		}
 		return [][]string{args}
 	}
-	return [][]string{{"ps"}}
+	return nil
 }
 
 func acquire(ctx context.Context, ops Operations, path string, wait time.Duration) error {

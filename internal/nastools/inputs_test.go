@@ -38,6 +38,9 @@ type fakeOperations struct {
 	commands        [][]string
 	lockPaths       []string
 	environments    [][]string
+	remotes         [][]string
+	remoteStatus    string
+	remoteFail      string
 	closed          int
 }
 
