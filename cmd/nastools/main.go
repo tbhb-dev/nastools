@@ -48,11 +48,20 @@ const (
 )
 
 type operations struct {
-	client  *ssh.Client
+	client  *ssh.Client // First connection, used for the lock session.
+	dial    func(context.Context) (*ssh.Client, error)
 	dir     string
 	cancel  context.CancelFunc
 	closers []io.Closer
 	workers sync.WaitGroup
+	mu      sync.Mutex
+	pool    []*pooledClient
+}
+
+// pooledClient counts the forwarding sessions busy on one SSH connection.
+type pooledClient struct {
+	client *ssh.Client
+	busy   int
 }
 
 func (*operations) ReadFile(path string) ([]byte, error) {
@@ -94,21 +103,52 @@ func (o *operations) Open(ctx context.Context, config nastools.SSH, env map[stri
 	if err != nil {
 		return "", nastools.ErrInvalid
 	}
-	agentConn, err := (&net.Dialer{}).DialContext(ctx, "unix", env["SSH_AUTH_SOCK"])
+	o.dial = func(ctx context.Context) (*ssh.Client, error) { return connect(ctx, config, env, verify) }
+	if o.client, err = o.dial(ctx); err != nil {
+		return "", nastools.ErrInvalid
+	}
+	o.pool = []*pooledClient{{client: o.client}}
+	socket := filepath.Join(o.dir, "d")
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "unix", socket)
 	if err != nil {
 		return "", nastools.ErrInvalid
+	}
+	o.closers = append(o.closers, listener)
+	context.AfterFunc(ctx, func() { _ = listener.Close() })
+	o.workers.Go(func() { o.forward(ctx, listener) })
+	return socket, nil
+}
+
+// connect opens one authenticated SSH connection. Every connection repeats the
+// agent authentication and the strict host-key check.
+func connect(
+	ctx context.Context,
+	config nastools.SSH,
+	env map[string]string,
+	verify ssh.HostKeyCallback,
+) (*ssh.Client, error) {
+	agentConn, err := (&net.Dialer{Timeout: sshDialTimeout}).DialContext(ctx, "unix", env["SSH_AUTH_SOCK"])
+	if err != nil {
+		return nil, nastools.ErrInvalid
 	}
 	defer agentConn.Close()
 	stopAgent := context.AfterFunc(ctx, func() { _ = agentConn.Close() })
 	defer stopAgent()
 	raw, err := (&net.Dialer{Timeout: sshDialTimeout}).DialContext(ctx, "tcp", env[config.AddressEnv])
 	if err != nil {
-		return "", nastools.ErrInvalid
+		return nil, nastools.ErrInvalid
 	}
-	o.closers = append(o.closers, raw)
+	connected := false
+	defer func() {
+		if !connected {
+			_ = raw.Close()
+		}
+	}()
 	context.AfterFunc(ctx, func() { _ = raw.Close() })
-	if raw.SetDeadline(time.Now().Add(sshHandshakeTimeout)) != nil {
-		return "", nastools.ErrInvalid
+	// The authentication callback reads from the agent, which needs the same deadline.
+	deadline := time.Now().Add(sshHandshakeTimeout)
+	if errors.Join(raw.SetDeadline(deadline), agentConn.SetDeadline(deadline)) != nil {
+		return nil, nastools.ErrInvalid
 	}
 	conn, channels, requests, err := ssh.NewClientConn(raw, env[config.AddressEnv], &ssh.ClientConfig{
 		User:            env[config.UserEnv],
@@ -121,22 +161,11 @@ func (o *operations) Open(ctx context.Context, config nastools.SSH, env map[stri
 			env[config.KnownHostsEnv],
 		),
 	})
-	if err != nil {
-		return "", nastools.ErrInvalid
+	if err != nil || raw.SetDeadline(time.Time{}) != nil {
+		return nil, nastools.ErrInvalid
 	}
-	if raw.SetDeadline(time.Time{}) != nil {
-		return "", nastools.ErrInvalid
-	}
-	o.client = ssh.NewClient(conn, channels, requests)
-	socket := filepath.Join(o.dir, "d")
-	listener, err := (&net.ListenConfig{}).Listen(ctx, "unix", socket)
-	if err != nil {
-		return "", nastools.ErrInvalid
-	}
-	o.closers = append(o.closers, listener)
-	context.AfterFunc(ctx, func() { _ = listener.Close() })
-	o.workers.Go(func() { o.forward(ctx, listener) })
-	return socket, nil
+	connected = true
+	return ssh.NewClient(conn, channels, requests), nil
 }
 
 func hostKeyAlgorithms(verify ssh.HostKeyCallback, address string, remote net.Addr, text string) []string {
@@ -160,7 +189,6 @@ func hostKeyAlgorithms(verify ssh.HostKeyCallback, address string, remote net.Ad
 func (o *operations) forward(ctx context.Context, listener net.Listener) {
 	var workers sync.WaitGroup
 	defer workers.Wait()
-	slots := make(chan struct{}, forwardSessionLimit)
 	for {
 		local, err := listener.Accept()
 		if err != nil {
@@ -168,21 +196,45 @@ func (o *operations) forward(ctx context.Context, listener net.Listener) {
 		}
 		// Listener shutdown closes every accepted connection before joining workers.
 		defer local.Close()
-		select {
-		case slots <- struct{}{}:
-		case <-ctx.Done():
-			return
-		}
-		workers.Go(func() {
-			defer func() { <-slots }()
-			o.forwardConnection(local)
-		})
+		workers.Go(func() { o.forwardConnection(ctx, local) })
 	}
 }
 
-func (o *operations) forwardConnection(local net.Conn) {
+// acquire never queues: when every connection has forwardSessionLimit sessions
+// busy it opens another one. A queued long-lived stream would starve silently.
+// Dialing under the lock lets a burst of requests share one new connection.
+func (o *operations) acquire(ctx context.Context) (*pooledClient, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for _, pooled := range o.pool {
+		if pooled.busy < forwardSessionLimit {
+			pooled.busy++
+			return pooled, nil
+		}
+	}
+	client, err := o.dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pooled := &pooledClient{client: client, busy: 1}
+	o.pool = append(o.pool, pooled)
+	return pooled, nil
+}
+
+func (o *operations) release(pooled *pooledClient) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	pooled.busy--
+}
+
+func (o *operations) forwardConnection(ctx context.Context, local net.Conn) {
 	defer local.Close()
-	session, sessionErr := o.client.NewSession()
+	pooled, err := o.acquire(ctx)
+	if err != nil {
+		return
+	}
+	defer o.release(pooled)
+	session, sessionErr := pooled.client.NewSession()
 	if sessionErr != nil {
 		return
 	}
@@ -260,7 +312,12 @@ func (o *operations) Close() {
 	for _, closer := range slices.Backward(o.closers) {
 		_ = closer.Close()
 	}
-	o.cancel()
+	o.cancel() // Before the pool lock, so a dial in progress ends and later dials fail.
+	o.mu.Lock()
+	for _, pooled := range o.pool {
+		_ = pooled.client.Close()
+	}
+	o.mu.Unlock()
 	o.workers.Wait()
 	_ = os.RemoveAll(o.dir)
 }
