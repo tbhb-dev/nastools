@@ -202,22 +202,22 @@ func maskOutput(out io.Writer, values []string, env map[string]string) error {
 }
 
 func Prepare(ctx context.Context, ops Operations, path string, c Config, env map[string]string) (Inputs, error) {
+	dir := filepath.Dir(path)
+	referenced := make(map[string]bool)
+	// Templates are read first so the caller can mask their variables on every failure below.
+	child, fileErr := c.fileEnvironment(ops, dir, env, referenced)
+	delete(referenced, "")
+	inputs := Inputs{Actions: env["GITHUB_ACTIONS"] != "", Referenced: slices.Sorted(maps.Keys(referenced))}
 	if err := c.validate(); err != nil {
-		return Inputs{}, err
+		return inputs, err
 	}
 	for _, name := range c.inputNames() {
 		if env[name] == "" {
-			return Inputs{}, fmt.Errorf("%s: %w", name, ErrInvalid)
+			return inputs, fmt.Errorf("%s: %w", name, ErrInvalid)
 		}
 	}
-	dir := filepath.Dir(path)
-	referenced := make(map[string]bool)
-	child, err := c.fileEnvironment(ops, dir, env, referenced)
-	delete(referenced, "")
-	// The caller masks the referenced values even on failure, so they come back with the error.
-	inputs := Inputs{Actions: env["GITHUB_ACTIONS"] != "", Referenced: slices.Sorted(maps.Keys(referenced))}
-	if err != nil {
-		return inputs, err
+	if fileErr != nil {
+		return inputs, fileErr
 	}
 	state, err := ops.GitState(ctx, dir)
 	if err != nil {
@@ -328,7 +328,7 @@ func prepared(ctx context.Context, ops Operations, path string, env map[string]s
 	inputs, err := Prepare(ctx, ops, path, config, env)
 	// Templates can read variables beyond the declared inputs, even on a failing path.
 	private := PrivateValues(config, env)
-	if maskErr := maskOutput(out, slices.DeleteFunc(inputs.Referenced, func(value string) bool {
+	if maskErr := maskOutput(out, slices.DeleteFunc(slices.Clone(inputs.Referenced), func(value string) bool {
 		return slices.Contains(private, value)
 	}), env); maskErr != nil {
 		return Inputs{}, maskErr
@@ -456,10 +456,12 @@ func relay(actions bool, out, errOut io.Writer, stdout, stderr []byte) error {
 		}
 	}
 	slices.Sort(names)
-	_, maskErr := io.WriteString(out, MaskCommands(slices.Compact(names), actions))
+	if _, err := io.WriteString(out, MaskCommands(slices.Compact(names), actions)); err != nil {
+		return fmt.Errorf("serve output: %w", ErrInvalid)
+	}
 	_, outErr := out.Write(stdout)
 	_, errErr := errOut.Write(stderr)
-	if errors.Join(maskErr, outErr, errErr) != nil {
+	if errors.Join(outErr, errErr) != nil {
 		return fmt.Errorf("serve output: %w", ErrInvalid)
 	}
 	return nil
@@ -485,6 +487,14 @@ func (command Command) arguments(wait int) [][]string {
 	return nil
 }
 
+// busy reports contention, unless the parent context ended the wait.
+func busy(parent context.Context) error {
+	if parent.Err() != nil {
+		return fmt.Errorf("deploy lock: %w", ErrInvalid)
+	}
+	return fmt.Errorf("%w: %w", ErrBusy, ErrInvalid)
+}
+
 func acquire(ctx context.Context, ops Operations, path string, wait time.Duration) error {
 	parent := ctx
 	if wait > 0 {
@@ -502,8 +512,11 @@ func acquire(ctx context.Context, ops Operations, path string, wait time.Duratio
 		if !expired && !errors.Is(err, ErrBusy) {
 			return fmt.Errorf("deploy lock: %w", ErrInvalid)
 		}
-		if expired || wait == 0 || ops.Pause(ctx) != nil {
+		if expired || wait == 0 {
 			return fmt.Errorf("%w: %w", ErrBusy, ErrInvalid)
+		}
+		if ops.Pause(ctx) != nil {
+			return busy(parent)
 		}
 	}
 }

@@ -4,6 +4,7 @@
 package nastools_test
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"slices"
@@ -312,4 +313,31 @@ func TestCommitLabelReachesCompose(t *testing.T) {
 			assert.Contains(t, f.environments[pull], tc.want)
 		})
 	}
+}
+
+// maskFailWriter rejects the mask command for a *.ts.net hostname.
+type maskFailWriter struct{ written []string }
+
+func (w *maskFailWriter) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte(".ts.net")) {
+		return 0, errPrivate
+	}
+	w.written = append(w.written, string(p))
+	return len(p), nil
+}
+
+func TestServeMaskFailureWritesNothing(t *testing.T) {
+	t.Parallel()
+	f := serveFake()
+	f.remoteDiag = "serving at node.example.ts.net\n"
+	env := environment()
+	env["GITHUB_ACTIONS"] = "true"
+	var out maskFailWriter
+	var errOut bytes.Buffer
+	err := nastools.Execute(t.Context(), f, "nastools.toml", env, &out, &errOut, nastools.Command{Name: "deploy"})
+	require.ErrorIs(t, err, nastools.ErrInvalid)
+	assert.NotContains(t, err.Error(), "ts.net")
+	assert.NotContains(t, errOut.String(), "ts.net")
+	assert.NotContains(t, strings.Join(out.written, ""), "ts.net")
+	assert.Len(t, f.remotes, 1)
 }

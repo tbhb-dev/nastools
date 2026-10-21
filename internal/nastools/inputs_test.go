@@ -44,6 +44,7 @@ type fakeOperations struct {
 	remoteOut       string
 	remoteDiag      string
 	lockBlock       bool
+	onPause         func()
 	closed          int
 }
 
@@ -367,6 +368,9 @@ func (f *fakeOperations) Lock(ctx context.Context, path string) error {
 
 func (f *fakeOperations) Pause(context.Context) error {
 	f.calls = append(f.calls, "pause")
+	if f.onPause != nil {
+		f.onPause()
+	}
 	return f.pauseErr
 }
 
@@ -410,6 +414,42 @@ func TestExpandedReferencesAreMasked(t *testing.T) {
 			}
 			require.NoError(t, err)
 			assert.Equal(t, masks, f.outputAtCompose)
+		})
+	}
+}
+
+func TestMasksSurviveEarlyValidationFailure(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		config  string
+		without string
+	}{
+		{
+			"invalid service ID",
+			configText + "[[serve]]\nservice = \"web\"\nhttps = 443\ntarget = \"http://127.0.0.1:3000\"\n",
+			"",
+		},
+		{"missing required input", configText, "REQUIRED_INPUT"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := &fakeOperations{files: map[string]string{
+				"nastools.toml":       tc.config,
+				"config/static.txt":   "static",
+				"config/expanded.txt": "${EXTRA_INPUT}",
+			}}
+			env := environment()
+			env["EXTRA_INPUT"] = "extra.example.invalid"
+			env["GITHUB_ACTIONS"] = "true"
+			delete(env, tc.without)
+			err := nastools.Execute(
+				t.Context(), f, "nastools.toml", env, &f.out, &f.out, nastools.Command{Name: nastools.CheckName},
+			)
+			require.ErrorIs(t, err, nastools.ErrInvalid)
+			assert.NotContains(t, err.Error(), "extra.example.invalid")
+			masks := nastools.MaskCommands(nastools.PrivateValues(config(), env), true)
+			assert.Equal(t, masks+"::add-mask::extra.example.invalid\n", f.out.String())
 		})
 	}
 }
