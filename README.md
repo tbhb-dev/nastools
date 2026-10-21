@@ -39,15 +39,15 @@ The default `wait_seconds` is 180. Project names use lowercase letters, digits, 
 
 Set `[ssh].lock_dir` to an existing absolute directory on the network-attached storage device that the SSH user can write. It has no default.
 
-Every required variable and SSH input must have a non-empty value. Static files enter the Compose child environment unchanged. An optional `[expand_files]` table uses the same output-variable-to-path format and expands environment references in memory. Use it only for a backend without native credential-file or file-backed expansion support. Missing expansion inputs and unknown config fields fail the check. Each Serve entry selects either `https` or `tcp`, with a matching HTTP(S) or TCP target, and uses a unique (Service ID, port) pair.
+Every required variable and SSH input must have a non-empty value. Static files enter the Compose child environment unchanged. An optional `[expand_files]` table uses the same output-variable-to-path format and expands environment references in memory. Use it only for a backend without native credential-file or file-backed expansion support. Missing expansion inputs and unknown config fields fail the check. Each Serve entry selects either `https` or `tcp`, with a matching HTTP(S) or TCP target, and uses a unique (Service ID, port) pair. A Service ID has the form `svc:` plus a DNS label of lowercase letters, digits, and hyphens, with no leading or trailing hyphen and at most 63 characters. Ports, including the port in a target, range from 1 to 65535.
 
-With a non-empty `GITHUB_ACTIONS` value, `check`, `deploy`, `status`, and `logs` emit mask commands for required values, SSH inputs, and comma-separated `NASTOOLS_PRIVATE_STRINGS` before validation output. Git state supplies the commit label, with `-dirty` for modified or new files.
+With a non-empty `GITHUB_ACTIONS` value, `check`, `deploy`, `status`, and `logs` emit mask commands for required values, SSH inputs, and comma-separated `NASTOOLS_PRIVATE_STRINGS` before validation output. They also mask every value that an `[expand_files]` template references. `deploy` and `status` hold back the `tailscale serve` output and the scoped Serve status, mask each Tailscale hostname (`*.ts.net`) in them, and only then print the text. Git state supplies the commit label, with `-dirty` for modified or new files.
 
 ## Deploy and inspect
 
 Run `nastools deploy --config path/to/nastools.toml` to check inputs, get the project lock, pull images with `--ignore-buildable`, bring up services with `--wait --wait-timeout <wait_seconds> --remove-orphans`, and publish the `[[serve]]` endpoints. It then prints `compose ps` and the Serve status. Each step must succeed before the next starts. Compose output streams to standard output and standard error. `config -q` output stays discarded.
 
-Deployments aren't transactional. A Serve failure exits nonzero after Compose has already brought the services up. Fix the cause and run `deploy` again.
+Deployments aren't transactional. A Serve failure exits nonzero after Compose has already brought the services up, and the error reports the failing entry as `serve[N]`. Fix the cause and run `deploy` again.
 
 ### Provenance
 
@@ -83,7 +83,7 @@ SSH setup:
 
 Each run creates a private temporary directory with mode 700 and a local Unix socket. Each socket connection opens an SSH session running `sudo -n /usr/local/bin/docker system dial-stdio`. Local Compose uses that socket through `DOCKER_HOST` and receives the checked input environment. nastools replaces inherited `DOCKER_HOST` and removes `DOCKER_CONTEXT`, `DOCKER_TLS`, `DOCKER_TLS_VERIFY`, and `DOCKER_CERT_PATH` for this connection. Normal completion, errors, SIGINT, and SIGTERM close the transport and remove its directory.
 
-The deployment lock is `<lock_dir>/<project>.lock`. An SSH session runs `flock -n <lockfile> cat` and holds the lock through status. If the lock is busy, nastools reports a deployment in progress and exits with an error. `nastools deploy --lock-wait 5m` retries for up to five minutes. The default is no wait. Closing the session releases the lock without persistent lock state or a break command. Different projects use different locks. `status` and `logs` don't get one.
+The deployment lock is `<lock_dir>/<project>.lock`. An SSH session runs `flock -n <lockfile> cat` and holds the lock through status. If the lock is busy, nastools reports a deployment in progress and exits with an error. `nastools deploy --lock-wait 5m` retries for up to five minutes and reports the same error if the lock is still busy then. If the lock session ends for any reason before the run finishes, nastools cancels the run. The default is no wait. Closing the session releases the lock without persistent lock state or a break command. Different projects use different locks. `status` and `logs` don't get one.
 
 Before deployment use, network-attached storage qualification must verify host keys and agent authentication. It must also verify `sudo` without interaction, `flock` release on disconnect, and the pinned Compose/Engine combination.
 

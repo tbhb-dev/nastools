@@ -7,6 +7,7 @@ import (
 	"context"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -33,13 +34,18 @@ const serveStatusJSON = `{"TCP":{"443":{"HTTPS":true}},"Services":{` +
 	`"svc:other":{"TCP":{"9":{}}}}}`
 
 // Remote records one remote command, writing the canned Serve status for a status query.
-func (f *fakeOperations) Remote(_ context.Context, argv []string, out, _ io.Writer) error {
+func (f *fakeOperations) Remote(_ context.Context, argv []string, out, errOut io.Writer) error {
 	f.calls = append(f.calls, "remote")
 	f.remotes = append(f.remotes, slices.Clone(argv))
+	output := f.remoteOut
 	if slices.Contains(argv, "status") {
-		if _, err := io.WriteString(out, f.remoteStatus); err != nil {
-			return errPrivate
-		}
+		output = f.remoteStatus
+	}
+	if _, err := io.WriteString(out, output); err != nil {
+		return errPrivate
+	}
+	if _, err := io.WriteString(errOut, f.remoteDiag); err != nil {
+		return errPrivate
 	}
 	if f.remoteFail != "" && slices.Contains(argv, f.remoteFail) {
 		return errPrivate
@@ -85,6 +91,7 @@ func TestServeFailureShortCircuits(t *testing.T) {
 		change      func(*fakeOperations)
 		wantRemotes int
 	}{
+		{"pull fails", func(f *fakeOperations) { f.failCommand = "pull" }, 0},
 		{"up fails", func(f *fakeOperations) { f.failCommand = "up" }, 0},
 		{"first endpoint fails", func(f *fakeOperations) { f.remoteFail = "--https=443" }, 1},
 	} {
@@ -137,11 +144,14 @@ func TestServeStatusFailures(t *testing.T) {
 	for _, tc := range []struct{ name, status, fail string }{
 		{"command", serveStatusJSON, "status"},
 		{"malformed", "not json private.example.invalid", ""},
+		{"empty", "", ""},
+		{"array", `["private.example.invalid"]`, ""},
+		{"services array", `{"Services":["private.example.invalid"]}`, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f := serveFake()
-			f.remoteStatus, f.remoteFail = tc.status, tc.fail
+			f.remoteStatus, f.remoteFail, f.remoteDiag = tc.status, tc.fail, "diagnostic.example.invalid"
 			err := nastools.Execute(
 				t.Context(),
 				f,
@@ -153,6 +163,99 @@ func TestServeStatusFailures(t *testing.T) {
 			)
 			require.ErrorIs(t, err, nastools.ErrInvalid)
 			assert.NotContains(t, err.Error(), "private.example.invalid")
+			assert.Equal(t, "compose output\ncompose diagnostic\n", f.out.String())
+		})
+	}
+}
+
+func TestServeStatusShapes(t *testing.T) {
+	t.Parallel()
+	for _, status := range []string{`null`, `{}`, `{"Services":null}`, `{"Services":{}}`, `{"Services":{"svc:other":{}}}`} {
+		t.Run(status, func(t *testing.T) {
+			t.Parallel()
+			f := serveFake()
+			f.remoteStatus = status
+			require.NoError(
+				t,
+				nastools.Execute(
+					t.Context(), f, "nastools.toml", environment(), &f.out, &f.out, nastools.Command{Name: "status"},
+				),
+			)
+			assert.Equal(t, "compose output\ncompose diagnostic\n{}\n", f.out.String())
+		})
+	}
+}
+
+func TestServeErrorsNameTheEntry(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ fail, want, other string }{
+		{"--https=443", "serve[0]", "serve[1]"},
+		{"--tcp=4317", "serve[1]", "serve[0]"},
+	} {
+		t.Run(tc.want, func(t *testing.T) {
+			t.Parallel()
+			f := serveFake()
+			f.remoteFail = tc.fail
+			err := nastools.Execute(
+				t.Context(), f, "nastools.toml", environment(), &f.out, &f.out, nastools.Command{Name: "deploy"},
+			)
+			require.ErrorIs(t, err, nastools.ErrInvalid)
+			assert.Contains(t, err.Error(), tc.want)
+			assert.NotContains(t, err.Error(), tc.other)
+			assert.NotContains(t, err.Error(), errPrivate.Error())
+			assert.NotContains(t, err.Error(), "svc:")
+		})
+	}
+}
+
+func TestServeOutputMasksServeNames(t *testing.T) {
+	t.Parallel()
+	const (
+		web   = "web.example.ts.net"
+		other = "other.example.ts.net"
+		diag  = "diag.example.ts.net"
+	)
+	for _, actions := range []bool{true, false} {
+		t.Run(strconv.FormatBool(actions), func(t *testing.T) {
+			t.Parallel()
+			f := serveFake()
+			f.remoteOut = "Available at https://" + web + "/\n"
+			f.remoteDiag = "warning " + diag + "\n"
+			f.remoteStatus = strings.Replace(
+				strings.Replace(serveStatusJSON, "web.example.invalid", web, 1), `"svc:other":{"TCP":{"9":{}}}`,
+				`"svc:other":{"Web":{"`+other+`:443":{}}}`, 1,
+			)
+			env := environment()
+			if actions {
+				env["GITHUB_ACTIONS"] = "true"
+			}
+			require.NoError(
+				t,
+				nastools.Execute(
+					t.Context(),
+					f,
+					"nastools.toml",
+					env,
+					&f.out,
+					&f.out,
+					nastools.Command{Name: "deploy"},
+				),
+			)
+			got := f.out.String()
+			assert.Equal(t, actions, strings.Contains(got, "::add-mask::"+web+"\n"))
+			assert.Equal(t, actions, strings.Contains(got, "::add-mask::"+diag+"\n"))
+			assert.NotContains(t, got, other, "unscoped Service IDs aren't printed or masked")
+			if actions {
+				// The first appearance of each name is its mask command.
+				for _, name := range []string{web, diag} {
+					assert.Equal(
+						t,
+						strings.Index(got, "::add-mask::"+name)+len("::add-mask::"),
+						strings.Index(got, name),
+					)
+				}
+			}
+			assert.Contains(t, got, "Available at https://"+web+"/\n")
 		})
 	}
 }

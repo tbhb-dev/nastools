@@ -98,9 +98,17 @@ func (c Config) validate() error {
 	return nil
 }
 
+const maxPort = 65535
+
+var serviceID = regexp.MustCompile(`^svc:[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+func validPort(port string) bool {
+	number, err := strconv.Atoi(port)
+	return err == nil && number >= 1 && number <= maxPort
+}
+
 func (e Endpoint) valid() bool {
-	const maxPort = 65535
-	if !strings.HasPrefix(e.Service, "svc:") || e.Service == "svc:" ||
+	if !serviceID.MatchString(e.Service) ||
 		(e.HTTPS > 0) == (e.TCP > 0) || e.HTTPS < 0 || e.TCP < 0 || e.HTTPS > maxPort || e.TCP > maxPort {
 		return false
 	}
@@ -109,9 +117,9 @@ func (e Endpoint) valid() bool {
 		return false
 	}
 	if e.TCP > 0 {
-		return u.Scheme == "tcp" && u.Port() != ""
+		return u.Scheme == "tcp" && validPort(u.Port())
 	}
-	return u.Scheme == "http" || u.Scheme == "https"
+	return (u.Scheme == "http" || u.Scheme == "https") && (u.Port() == "" || validPort(u.Port()))
 }
 
 func resolve(dir, path string) string {
@@ -150,6 +158,10 @@ type Inputs struct {
 	Dir    string
 	Env    []string
 	Commit string
+	// Actions reports a non-empty GITHUB_ACTIONS value.
+	Actions bool
+	// Referenced holds the non-empty values that expanded file templates read.
+	Referenced []string
 }
 
 func (c Config) inputNames() []string {
@@ -182,6 +194,13 @@ func MaskCommands(values []string, githubActions bool) string {
 	return out.String()
 }
 
+func maskOutput(out io.Writer, values []string, env map[string]string) error {
+	if _, err := io.WriteString(out, MaskCommands(values, env["GITHUB_ACTIONS"] != "")); err != nil {
+		return fmt.Errorf("mask output: %w", ErrInvalid)
+	}
+	return nil
+}
+
 func Prepare(ctx context.Context, ops Operations, path string, c Config, env map[string]string) (Inputs, error) {
 	if err := c.validate(); err != nil {
 		return Inputs{}, err
@@ -192,21 +211,29 @@ func Prepare(ctx context.Context, ops Operations, path string, c Config, env map
 		}
 	}
 	dir := filepath.Dir(path)
-	child, err := c.fileEnvironment(ops, dir, env)
+	referenced := make(map[string]bool)
+	child, err := c.fileEnvironment(ops, dir, env, referenced)
+	delete(referenced, "")
+	// The caller masks the referenced values even on failure, so they come back with the error.
+	inputs := Inputs{Actions: env["GITHUB_ACTIONS"] != "", Referenced: slices.Sorted(maps.Keys(referenced))}
 	if err != nil {
-		return Inputs{}, err
+		return inputs, err
 	}
 	state, err := ops.GitState(ctx, dir)
 	if err != nil {
-		return Inputs{}, fmt.Errorf("git: %w", ErrInvalid)
+		return inputs, fmt.Errorf("git: %w", ErrInvalid)
 	}
 	// Provenance travels in the Compose environment: a compose file references
 	// ${NASTOOLS_COMMIT} in a service label, so Compose owns applying it.
 	child["NASTOOLS_COMMIT"] = state.Label()
-	return Inputs{Config: c, Dir: dir, Env: childEnvironment(child), Commit: state.Label()}, nil
+	inputs.Config, inputs.Dir, inputs.Env, inputs.Commit = c, dir, childEnvironment(child), state.Label()
+	return inputs, nil
 }
 
-func (c Config) fileEnvironment(ops Operations, dir string, env map[string]string) (map[string]string, error) {
+// fileEnvironment records in referenced every value an expanded file reads.
+func (c Config) fileEnvironment(
+	ops Operations, dir string, env map[string]string, referenced map[string]bool,
+) (map[string]string, error) {
 	paths := make(map[string]string)
 	maps.Copy(paths, c.Files)
 	for _, name := range slices.Sorted(maps.Keys(c.ExpandFiles)) {
@@ -231,6 +258,7 @@ func (c Config) fileEnvironment(ops Operations, dir string, env map[string]strin
 		var missing bool
 		child[name] = os.Expand(child[name], func(key string) string {
 			missing = missing || env[key] == ""
+			referenced[env[key]] = true
 			return env[key]
 		})
 		if missing {
@@ -252,11 +280,8 @@ func Load(ops Operations, path string, env map[string]string, out io.Writer) (Co
 	data, readErr := ops.ReadFile(path)
 	c, err := parse(data)
 	// Mask even on read or parse failure, retaining any partially decoded input names.
-	if _, writeErr := io.WriteString(
-		out,
-		MaskCommands(PrivateValues(c, env), env["GITHUB_ACTIONS"] != ""),
-	); writeErr != nil {
-		return c, fmt.Errorf("mask output: %w", ErrInvalid)
+	if maskErr := maskOutput(out, PrivateValues(c, env), env); maskErr != nil {
+		return c, maskErr
 	}
 	if readErr != nil {
 		return c, fmt.Errorf("nastools.toml: unreadable input: %w", ErrInvalid)
@@ -294,14 +319,27 @@ type Command struct {
 	LockWait time.Duration
 }
 
+// prepared loads and prepares the inputs, masking every private value before any output.
+func prepared(ctx context.Context, ops Operations, path string, env map[string]string, out io.Writer) (Inputs, error) {
+	config, err := Load(ops, path, env, out)
+	if err != nil {
+		return Inputs{}, err
+	}
+	inputs, err := Prepare(ctx, ops, path, config, env)
+	// Templates can read variables beyond the declared inputs, even on a failing path.
+	private := PrivateValues(config, env)
+	if maskErr := maskOutput(out, slices.DeleteFunc(inputs.Referenced, func(value string) bool {
+		return slices.Contains(private, value)
+	}), env); maskErr != nil {
+		return Inputs{}, maskErr
+	}
+	return inputs, err
+}
+
 func Execute(ctx context.Context, ops Operations, path string, env map[string]string,
 	out, errOut io.Writer, command Command,
 ) error {
-	config, err := Load(ops, path, env, out)
-	if err != nil {
-		return err
-	}
-	inputs, err := Prepare(ctx, ops, path, config, env)
+	inputs, err := prepared(ctx, ops, path, env, out)
 	if err != nil {
 		return err
 	}
@@ -321,7 +359,7 @@ func Execute(ctx context.Context, ops Operations, path string, env map[string]st
 		return fmt.Errorf("SSH transport: %w", ErrInvalid)
 	}
 	if command.Name == Deploy {
-		lock := filepath.Join(config.SSH.LockDir, config.Project+".lock")
+		lock := filepath.Join(inputs.Config.SSH.LockDir, inputs.Config.Project+".lock")
 		if err = acquire(ctx, ops, lock, command.LockWait); err != nil {
 			return err
 		}
@@ -344,7 +382,7 @@ func Execute(ctx context.Context, ops Operations, path string, env map[string]st
 // report runs after Compose has succeeded. A Serve failure leaves the stack up.
 func (command Command) report(ctx context.Context, ops Operations, inputs Inputs, out, errOut io.Writer) error {
 	if command.Name == Deploy {
-		if err := publish(ctx, ops, inputs.Config.Serve, out, errOut); err != nil {
+		if err := publish(ctx, ops, inputs, out, errOut); err != nil {
 			return err
 		}
 	}
@@ -354,48 +392,75 @@ func (command Command) report(ctx context.Context, ops Operations, inputs Inputs
 	if err := compose(ctx, ops, inputs, []string{"ps"}, out, errOut); err != nil {
 		return err
 	}
-	return serveStatus(ctx, ops, inputs.Config.Serve, out, errOut)
+	return serveStatus(ctx, ops, inputs, out, errOut)
 }
 
 // publish applies each declared endpoint. Re-running a Serve command with the
 // same flags is idempotent, and the flags scope each command to one Service ID.
-func publish(ctx context.Context, ops Operations, endpoints []Endpoint, out, errOut io.Writer) error {
-	for _, e := range endpoints {
+func publish(ctx context.Context, ops Operations, inputs Inputs, out, errOut io.Writer) error {
+	for i, e := range inputs.Config.Serve {
 		port := "--https=" + strconv.Itoa(e.HTTPS)
 		if e.TCP > 0 {
 			port = "--tcp=" + strconv.Itoa(e.TCP)
 		}
+		var stdout, stderr bytes.Buffer
 		argv := []string{"tailscale", "serve", "--service=" + e.Service, port, e.Target}
-		if ops.Remote(ctx, argv, out, errOut) != nil {
-			return fmt.Errorf("serve: %w", ErrInvalid)
+		runErr := ops.Remote(ctx, argv, &stdout, &stderr)
+		if err := relay(inputs.Actions, out, errOut, stdout.Bytes(), stderr.Bytes()); err != nil {
+			return err
+		}
+		if runErr != nil {
+			return fmt.Errorf("serve[%d]: %w", i, ErrInvalid)
 		}
 	}
 	return nil
 }
 
 // serveStatus prints the Serve status of the declared Service IDs only.
-func serveStatus(ctx context.Context, ops Operations, endpoints []Endpoint, out, errOut io.Writer) error {
-	if len(endpoints) == 0 {
+func serveStatus(ctx context.Context, ops Operations, inputs Inputs, out, errOut io.Writer) error {
+	if len(inputs.Config.Serve) == 0 {
 		return nil
 	}
-	var raw bytes.Buffer
+	var raw, stderr bytes.Buffer
 	var status struct {
 		Services map[string]json.RawMessage `json:"Services"`
 	}
-	if ops.Remote(ctx, []string{"tailscale", "serve", "status", "--json"}, &raw, errOut) != nil ||
+	if ops.Remote(ctx, []string{"tailscale", "serve", "status", "--json"}, &raw, &stderr) != nil ||
 		json.Unmarshal(raw.Bytes(), &status) != nil {
 		return fmt.Errorf("serve status: %w", ErrInvalid)
 	}
 	scoped := make(map[string]json.RawMessage)
-	for _, e := range endpoints {
+	for _, e := range inputs.Config.Serve {
 		if service, ok := status.Services[e.Service]; ok {
 			scoped[e.Service] = service
 		}
 	}
-	encoder := json.NewEncoder(out)
+	var encoded bytes.Buffer
+	encoder := json.NewEncoder(&encoded)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(scoped); err != nil {
 		return fmt.Errorf("serve status: %w", ErrInvalid)
+	}
+	return relay(inputs.Actions, out, errOut, encoded.Bytes(), stderr.Bytes())
+}
+
+var serveHostname = regexp.MustCompile(`[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.ts\.net`)
+
+// relay prints held Serve output. Holding the text back masks every *.ts.net
+// hostname before a byte prints, so nothing needs suppressing under GitHub Actions.
+func relay(actions bool, out, errOut io.Writer, stdout, stderr []byte) error {
+	var names []string
+	for _, text := range [][]byte{stdout, stderr} {
+		for _, name := range serveHostname.FindAll(text, -1) {
+			names = append(names, string(name))
+		}
+	}
+	slices.Sort(names)
+	_, maskErr := io.WriteString(out, MaskCommands(slices.Compact(names), actions))
+	_, outErr := out.Write(stdout)
+	_, errErr := errOut.Write(stderr)
+	if errors.Join(maskErr, outErr, errErr) != nil {
+		return fmt.Errorf("serve output: %w", ErrInvalid)
 	}
 	return nil
 }
@@ -421,6 +486,7 @@ func (command Command) arguments(wait int) [][]string {
 }
 
 func acquire(ctx context.Context, ops Operations, path string, wait time.Duration) error {
+	parent := ctx
 	if wait > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, wait)
@@ -431,10 +497,12 @@ func acquire(ctx context.Context, ops Operations, path string, wait time.Duratio
 		if err == nil {
 			return nil
 		}
-		if !errors.Is(err, ErrBusy) {
+		// A wait that expires mid-attempt may fail the transport, yet the lock was still busy.
+		expired := parent.Err() == nil && errors.Is(ctx.Err(), context.DeadlineExceeded)
+		if !expired && !errors.Is(err, ErrBusy) {
 			return fmt.Errorf("deploy lock: %w", ErrInvalid)
 		}
-		if wait == 0 || ops.Pause(ctx) != nil {
+		if expired || wait == 0 || ops.Pause(ctx) != nil {
 			return fmt.Errorf("%w: %w", ErrBusy, ErrInvalid)
 		}
 	}

@@ -228,3 +228,19 @@ func assertCommands(t *testing.T, f *fakeOperations, base []string, want [][]str
 		}
 	}
 }
+
+func TestLockWaitExpiresDuringAttempt(t *testing.T) {
+	t.Parallel()
+	f := &fakeOperations{
+		files:     map[string]string{"nastools.toml": strings.Split(configText, "[files]")[0]},
+		lockBlock: true,
+	}
+	err := nastools.Execute(
+		t.Context(), f, "nastools.toml", environment(), &f.out, &f.out,
+		nastools.Command{Name: "deploy", LockWait: time.Millisecond},
+	)
+	require.ErrorIs(t, err, nastools.ErrBusy)
+	require.ErrorIs(t, err, nastools.ErrInvalid)
+	assert.Len(t, f.lockPaths, 1)
+	assert.Equal(t, 1, f.closed)
+}

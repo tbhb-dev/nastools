@@ -41,6 +41,9 @@ type fakeOperations struct {
 	remotes         [][]string
 	remoteStatus    string
 	remoteFail      string
+	remoteOut       string
+	remoteDiag      string
+	lockBlock       bool
 	closed          int
 }
 
@@ -347,9 +350,13 @@ func (f *fakeOperations) Open(_ context.Context, config nastools.SSH, env map[st
 	return "/example.invalid/socket", f.openErr
 }
 
-func (f *fakeOperations) Lock(_ context.Context, path string) error {
+func (f *fakeOperations) Lock(ctx context.Context, path string) error {
 	f.calls = append(f.calls, "lock")
 	f.lockPaths = append(f.lockPaths, path)
+	if f.lockBlock {
+		<-ctx.Done()
+		return errPrivate
+	}
 	if len(f.lockErrors) == 0 {
 		return nil
 	}
@@ -364,3 +371,45 @@ func (f *fakeOperations) Pause(context.Context) error {
 }
 
 func (f *fakeOperations) Close() { f.closed++; f.calls = append(f.calls, "close") }
+
+func TestExpandedReferencesAreMasked(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		template string
+		actions  bool
+		wantErr  bool
+		want     string
+	}{
+		{"referenced", "${EXTRA_INPUT}", true, false, "::add-mask::extra.example.invalid\n"},
+		{"already masked", "${REQUIRED_INPUT}", true, false, ""},
+		{"missing sibling", "${EXTRA_INPUT} ${MISSING}", true, true, "::add-mask::extra.example.invalid\n"},
+		{"outside actions", "${EXTRA_INPUT}", false, false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := &fakeOperations{files: map[string]string{
+				"nastools.toml":       configText,
+				"config/static.txt":   "static",
+				"config/expanded.txt": tc.template,
+			}}
+			env := environment()
+			env["EXTRA_INPUT"] = "extra.example.invalid"
+			if tc.actions {
+				env["GITHUB_ACTIONS"] = "true"
+			}
+			err := nastools.Execute(
+				t.Context(), f, "nastools.toml", env, &f.out, &f.out, nastools.Command{Name: nastools.CheckName},
+			)
+			masks := nastools.MaskCommands(nastools.PrivateValues(config(), env), tc.actions) + tc.want
+			if tc.wantErr {
+				require.ErrorIs(t, err, nastools.ErrInvalid)
+				assert.NotContains(t, err.Error(), "extra.example.invalid")
+				assert.Equal(t, masks, f.out.String())
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, masks, f.outputAtCompose)
+		})
+	}
+}

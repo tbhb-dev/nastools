@@ -35,8 +35,18 @@ func main() {
 		name, value, _ := strings.Cut(entry, "=")
 		env[name] = value
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	code := Run(ctx, os.Args[1:], streams{in: os.Stdin, out: os.Stdout, err: os.Stderr}, &operations{cancel: stop}, env)
+	signalled, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// Lock loss cancels this context. Calling stop for it would drop the signal handlers
+	// and let a later interrupt end the process before cleanup.
+	ctx, abort := context.WithCancel(signalled)
+	code := Run(
+		ctx,
+		os.Args[1:],
+		streams{in: os.Stdin, out: os.Stdout, err: os.Stderr},
+		&operations{cancel: abort},
+		env,
+	)
+	abort()
 	stop()
 	os.Exit(code)
 }
@@ -91,15 +101,11 @@ func (*operations) Compose(ctx context.Context, args, env []string, out, errOut 
 
 // Remote runs one command on the remote host in its own session on a pooled connection.
 func (o *operations) Remote(ctx context.Context, argv []string, out, errOut io.Writer) error {
-	pooled, err := o.acquire(ctx)
+	session, pooled, err := o.newSession(ctx)
 	if err != nil {
 		return nastools.ErrInvalid
 	}
 	defer o.release(pooled)
-	session, err := pooled.client.NewSession()
-	if err != nil {
-		return nastools.ErrInvalid
-	}
 	defer session.Close()
 	stop := context.AfterFunc(ctx, func() { _ = session.Close() })
 	defer stop()
@@ -227,22 +233,46 @@ func (o *operations) forward(ctx context.Context, listener net.Listener) {
 // acquire never queues: when every connection has forwardSessionLimit sessions
 // busy it opens another one. A queued long-lived stream would starve silently.
 // Dialing under the lock lets a burst of requests share one new connection.
-func (o *operations) acquire(ctx context.Context) (*pooledClient, error) {
+func (o *operations) acquire(ctx context.Context) (*pooledClient, bool, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	for _, pooled := range o.pool {
 		if pooled.busy < forwardSessionLimit {
 			pooled.busy++
-			return pooled, nil
+			return pooled, false, nil
 		}
 	}
 	client, err := o.dial(ctx)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	pooled := &pooledClient{client: client, busy: 1}
 	o.pool = append(o.pool, pooled)
-	return pooled, nil
+	return pooled, true, nil
+}
+
+// newSession opens a session on a pooled connection. A pooled connection that
+// fails to open one is dead (an idle connection that a gateway dropped), so it
+// leaves the pool and another one serves the request. A fresh connection that
+// fails ends the attempt.
+func (o *operations) newSession(ctx context.Context) (*ssh.Session, *pooledClient, error) {
+	for {
+		pooled, dialed, err := o.acquire(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		session, err := pooled.client.NewSession()
+		if err == nil {
+			return session, pooled, nil
+		}
+		o.mu.Lock()
+		o.pool = slices.DeleteFunc(o.pool, func(p *pooledClient) bool { return p == pooled })
+		o.mu.Unlock()
+		_ = pooled.client.Close()
+		if dialed {
+			return nil, nil, sanitized(err)
+		}
+	}
 }
 
 func (o *operations) release(pooled *pooledClient) {
@@ -253,15 +283,11 @@ func (o *operations) release(pooled *pooledClient) {
 
 func (o *operations) forwardConnection(ctx context.Context, local net.Conn) {
 	defer local.Close()
-	pooled, err := o.acquire(ctx)
+	session, pooled, err := o.newSession(ctx)
 	if err != nil {
 		return
 	}
 	defer o.release(pooled)
-	session, sessionErr := pooled.client.NewSession()
-	if sessionErr != nil {
-		return
-	}
 	defer session.Close()
 	input, inputErr := session.StdinPipe()
 	output, outputErr := session.StdoutPipe()
@@ -314,11 +340,13 @@ func (o *operations) Lock(ctx context.Context, path string) error {
 		}
 		return nastools.ErrInvalid
 	}
-	o.closers = append(o.closers, input)
+	// Close ends the session by closing its input first. Any exit before then,
+	// clean or not, means the remote lock holder is gone.
+	o.closers = append(o.closers, session, input)
 	o.workers.Go(func() {
-		if session.Wait() != nil {
-			o.cancel()
-		}
+		exitErr := session.Wait()
+		_ = exitErr
+		o.cancel()
 	})
 	return nil
 }
