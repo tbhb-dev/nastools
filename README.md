@@ -1,6 +1,6 @@
 # nastools
 
-nastools deploys a Compose stack to Synology over SSH, with strict host identity checks and file-based configuration and secrets. It preserves persistent bind-mounted data and checks service readiness. Tailscale Service mappings and provenance labels belong to a later phase. Rollback redeploys an earlier compatible commit.
+nastools deploys a Compose stack to Synology over SSH, with strict host identity checks and file-based configuration and secrets. It preserves persistent bind-mounted data and checks service readiness. It publishes declared Tailscale Serve endpoints and labels each deployment with its commit. Rollback redeploys an earlier compatible commit.
 
 ## Development
 
@@ -41,17 +41,36 @@ Set `[ssh].lock_dir` to an existing absolute directory on the network-attached s
 
 Every required variable and SSH input must have a non-empty value. Static files enter the Compose child environment unchanged. An optional `[expand_files]` table uses the same output-variable-to-path format and expands environment references in memory. Use it only for a backend without native credential-file or file-backed expansion support. Missing expansion inputs and unknown config fields fail the check. Each Serve entry selects either `https` or `tcp`, with a matching HTTP(S) or TCP target, and uses a unique (Service ID, port) pair.
 
-With a non-empty `GITHUB_ACTIONS` value, `check`, `deploy`, `status`, and `logs` emit mask commands for required values, SSH inputs, and comma-separated `NASTOOLS_PRIVATE_STRINGS` before validation output. Git state supplies the commit label, with `-dirty` for modified or new files. Provenance labels and Serve operations belong to a later phase.
+With a non-empty `GITHUB_ACTIONS` value, `check`, `deploy`, `status`, and `logs` emit mask commands for required values, SSH inputs, and comma-separated `NASTOOLS_PRIVATE_STRINGS` before validation output. Git state supplies the commit label, with `-dirty` for modified or new files.
 
 ## Deploy and inspect
 
-Run `nastools deploy --config path/to/nastools.toml` to check inputs, get the project lock, pull images with `--ignore-buildable`, and bring up services with `--wait --wait-timeout <wait_seconds> --remove-orphans`. It then prints `compose ps`. Each step must succeed before the next starts. Compose output streams to standard output and standard error. `config -q` output stays discarded.
+Run `nastools deploy --config path/to/nastools.toml` to check inputs, get the project lock, pull images with `--ignore-buildable`, bring up services with `--wait --wait-timeout <wait_seconds> --remove-orphans`, and publish the `[[serve]]` endpoints. It then prints `compose ps` and the Serve status. Each step must succeed before the next starts. Compose output streams to standard output and standard error. `config -q` output stays discarded.
 
-Deployments aren't transactional.
+Deployments aren't transactional. A Serve failure exits nonzero after Compose has already brought the services up. Fix the cause and run `deploy` again.
+
+### Provenance
+
+`check`, `deploy`, `status`, and `logs` pass the checkout's commit to Compose as `NASTOOLS_COMMIT`, with `-dirty` appended for modified or new files. Reference it in a service label to record the deployed commit:
+
+```yaml
+services:
+  example:
+    labels:
+      example.invalid/commit: ${NASTOOLS_COMMIT}
+```
+
+Compose recreates a service whose label changes. A labelled service restarts on every new commit. Label only the services that can tolerate that.
+
+### Serve
+
+After `compose up --wait` succeeds, `deploy` applies each `[[serve]]` entry with one command over an SSH session on the existing transport. An `https` entry runs `tailscale serve --service=<service> --https=<port> <target>`, and a `tcp` entry runs `tailscale serve --service=<service> --tcp=<port> <target>`. Services run in the background without `--bg`. The commands run without `sudo`. Only Docker access needs it, and the SSH user must hold Serve authority for each declared Service ID. Repeating a command with the same flags keeps the configuration unchanged. nastools names only declared Service IDs and doesn't reset Serve.
+
+nastools doesn't remove endpoints. After deleting an entry, remove its listener by hand, scoped to that Service ID and port: `tailscale serve --service=<service> --https=<port> off`, or `--tcp=<port>` for a TCP entry.
 
 Inspection commands also accept `--config`:
 
-- `nastools status` prints `compose ps`.
+- `nastools status` prints `compose ps`, then the `tailscale serve status --json` entries for the configured Service IDs. It leaves out other Service IDs.
 - `nastools logs [service] --tail N --follow` streams native Compose logs.
 - The default tail is 100 lines per service. Omit `--follow` to return after printing them.
 

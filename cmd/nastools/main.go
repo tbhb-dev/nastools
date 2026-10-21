@@ -89,6 +89,30 @@ func (*operations) Compose(ctx context.Context, args, env []string, out, errOut 
 	return sanitized(cmd.Run())
 }
 
+// Remote runs one command on the remote host in its own session on a pooled connection.
+func (o *operations) Remote(ctx context.Context, argv []string, out, errOut io.Writer) error {
+	pooled, err := o.acquire(ctx)
+	if err != nil {
+		return nastools.ErrInvalid
+	}
+	defer o.release(pooled)
+	session, err := pooled.client.NewSession()
+	if err != nil {
+		return nastools.ErrInvalid
+	}
+	defer session.Close()
+	stop := context.AfterFunc(ctx, func() { _ = session.Close() })
+	defer stop()
+	session.Stdout, session.Stderr = out, errOut
+	quoted := make([]string, len(argv))
+	for i, arg := range argv {
+		quoted[i] = quote(arg)
+	}
+	return sanitized(session.Run(strings.Join(quoted, " ")))
+}
+
+func quote(arg string) string { return "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'" }
+
 func (o *operations) Open(ctx context.Context, config nastools.SSH, env map[string]string) (string, error) {
 	var err error
 	o.dir, err = os.MkdirTemp("", "nt-") // Mode 0700. A short name fits macOS Unix sockets.
@@ -271,7 +295,7 @@ func (o *operations) Lock(ctx context.Context, path string) error {
 	}
 	input, inputErr := session.StdinPipe()
 	output, outputErr := session.StdoutPipe()
-	command := "flock -n '" + strings.ReplaceAll(path, "'", "'\\''") + "' cat"
+	command := "flock -n " + quote(path) + " cat"
 	if err = errors.Join(inputErr, outputErr, session.Start(command)); err != nil {
 		_ = session.Close()
 		return nastools.ErrInvalid
