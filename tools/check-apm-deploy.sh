@@ -13,6 +13,8 @@
 #   * anything lands in an antigravity location, or the agy package
 #     deploys a file
 #   * a Claude skill lacks its Codex twin under .agents/skills/
+#   * agent-commit, agent-pr, or agent-merge-pr is missing from either
+#     harness tree
 #
 # After a deliberate pin move, review the new set and record it with
 # `bash tools/check-apm-deploy.sh --record`.
@@ -85,6 +87,15 @@ for skill in "${skills[@]}"; do
     echo "Claude skill $name has no Codex twin at .agents/skills/$name" >&2
     rc=1
   fi
+done
+
+for name in agent-commit agent-pr agent-merge-pr; do
+  for dir in .claude/skills .agents/skills; do
+    if [[ ! -f $dir/$name/SKILL.md ]]; then
+      echo "the $name skill is not deployed at $dir/$name" >&2
+      rc=1
+    fi
+  done
 done
 
 if [[ $rc -eq 0 ]]; then

@@ -52,6 +52,17 @@ file=${1:-}
   exit 1
 }
 
+# Resolve symlinks and parent components before checking cspell's scope.
+resolved_file=$(realpath "$file") || exit 1
+resolved_root=$(realpath "$root") || exit 1
+case $resolved_file in
+"$resolved_root"/*) ;;
+*)
+  printf '%s:1 [error] outside-repo  cspell only lints files under the repository; move the draft inside it\n' "$file"
+  exit 1
+  ;;
+esac
+
 # Source files answer to the tree-wide recipes. The probe below sends
 # bare prose, which a Go file would reject as code rather than comment,
 # so it would report every source file as unscoped.
@@ -86,7 +97,7 @@ probe_rc=$?
 probe=$(printf '%s\n' "$probe_out" | grep -c '^[0-9]' || true)
 
 if [ "$probe_rc" -gt 1 ]; then
-  # shellcheck disable=SC2312 # the output is only reported
+  # shellcheck disable=SC2312 # tr only flattens an already failed probe for diagnostics
   printf '%s:1 [error] vale-failed  vale exited %s instead of linting, so this run measured nothing: %s\n' \
     "$file" "$probe_rc" "$(printf '%s' "$probe_out" | tr '\n' ' ')"
   rc=1

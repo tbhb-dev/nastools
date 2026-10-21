@@ -12,7 +12,7 @@ This repository is public. Never commit a hostname, an address outside the docum
 
 ## Tools
 
-mise pins the tools and defines the tasks. The shared half arrives from `tbhb-dev/devtools` through vendir into `.config/mise/conf.d/` and `.devtools/`. Never edit those two directories by hand. Run `mise run bootstrap` once. It syncs the payload, then installs the tools and the git hooks.
+mise pins the tools and defines the tasks. The shared half arrives from `tbhb-dev/devtools` through vendir into `.config/mise/conf.d/` and `.devtools/`. Never edit those two directories by hand. Run `mise run bootstrap` once. It syncs the payload, installs the pinned toolchain and the Vale styles, then installs the git hooks and the pre-push wrapper.
 
 `nastools` exposes `version` and `check`. Its entry point calls `Run` in `run.go`. Tests inject process streams. `internal/nastools/` owns input policy through one Operations interface, with thin production adapters in `main.go`. `internal/buildmeta/` supplies linker-injected metadata and a runtime build-info fallback for the version. `mise run build` writes `bin/nastools` through the payload's linker flags script.
 
@@ -23,9 +23,9 @@ mise pins the tools and defines the tasks. The shared half arrives from `tbhb-de
 - `mise run cover-go` enforces the payload's coverage thresholds. Add tests when coverage drops below a threshold.
 - `mise run vendor` refreshes dependencies. `mise run vendor-check` rejects tracked drift and files outside the index. Keep Go tool directives and their vendored sources in sync.
 - `mise run lint-draft <file>` runs every prose gate over one draft.
-- `mise run devtools:update-pins <version>` moves every devtools pin together. Redeploy the agent primitives with `mise run apm-sync` instead of a bare `apm install`.
+- `mise run devtools:update-pins <version>` moves every devtools pin together. Redeploy the agent primitives with `mise run devtools:apm-sync` instead of a bare `apm install`.
 
-A task in `mise.toml` that replaces or narrows a payload task has a comment with the number of the devtools issue behind it. The `guard-markdown` binary must be on PATH for `lint-markdown-wrap` and the Claude write hook. `mise run bootstrap` installs it through `mise run install-guard-markdown`, which takes the version from the devtools pin in `apm.yml`. Keep the Go bin directory on PATH.
+A task in `mise.toml` that replaces or narrows a payload task has a comment with the number of the devtools issue behind it. The `guard-markdown`, `commit-lint` and `agentrepo` commands come from `go:` pins in `mise.toml` at the devtools version, which `mise run devtools:update-pins` moves with the other pin sites. Run agent sessions under `mise exec --` so the Claude write hook and the skills find them on PATH.
 
 ## Continuous integration
 

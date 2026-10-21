@@ -5,13 +5,18 @@
 # cspell:ignore compgen gpgsign btrfs servicesx nothex repointed gitlink cacheinfo
 
 setup() {
+	local name
+	for name in ${!GIT_CONFIG_@} ${!GIT_AUTHOR_@} ${!GIT_COMMITTER_@}; do
+		unset "$name"
+	done
+	export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 	checker="$BATS_TEST_DIRNAME/check-leaks.sh"
 	# The scheme separator, kept out of the source so a search for it finds only real uses.
 	op_slashes=/
 	repo_root=$(git -C "$BATS_TEST_DIRNAME" rev-parse --show-toplevel)
 
 	unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY
-	unset PRE_COMMIT_FROM_REF PRE_COMMIT_TO_REF GITHUB_ACTIONS CI
+	unset PRE_COMMIT_FROM_REF PRE_COMMIT_TO_REF GITHUB_ACTIONS CI DEVTOOLS_LEAK_HOOK_CHECK
 	for name in $(compgen -v O11Y_); do unset "$name"; done
 
 	export O11Y_PRIVATE_STRINGS="zebra-host-01, /zq/stash/dir, /zq/bin/tsc, quokka-pond, 203.0.113.77, kestrel99, mango-secret"
@@ -143,6 +148,25 @@ run_check() {
 	[[ $output == *"leak.md:1: pattern: tailnet host name"* ]]
 }
 
+@test "the vendored leak suite is exempt from patterns without an allow list" {
+	rm .leak-allow
+	mkdir -p .devtools/scripts
+	cp "$BATS_TEST_FILENAME" .devtools/scripts/check-leaks.bats
+	O11Y_PRIVATE_STRINGS='' run_check .devtools/scripts/check-leaks.bats
+	[ "$status" -eq 0 ]
+	[[ $output != *"pattern:"* ]]
+	literal="vendored-""private-value"
+	echo "$literal" >>.devtools/scripts/check-leaks.bats
+	O11Y_PRIVATE_STRINGS=$literal run_check .devtools/scripts/check-leaks.bats
+	[ "$status" -eq 1 ]
+	[[ $output == *"private literal O11Y_PRIVATE_STRINGS entry 1"* ]]
+	no_value "$literal"
+	echo '10.1.2.3' >.devtools/scripts/other.bats
+	run_check .devtools/scripts/other.bats
+	[ "$status" -eq 1 ]
+	[[ $output == *"pattern: private IPv4 address"* ]]
+}
+
 @test "vendored trees are exempt from patterns but not from literals" {
 	mkdir -p .devtools .claude/skills .vale .config/mise/conf.d tools
 	local dir
@@ -150,11 +174,13 @@ run_check() {
 		echo "see 10.1.2.3 and op:$op_slashes/a/b/c and /volume1/x" >"$dir/vendored.md"
 	done
 	echo "pattern 10.1.2.3" >tools/check-leaks.bats
-	git ls-files --others --exclude-standard -z | xargs -0 git add --
+	git ls-files --others --exclude-standard -z >"$BATS_TEST_TMPDIR/files"
+	xargs -0 git add -- <"$BATS_TEST_TMPDIR/files"
 	run_check
 	[ "$status" -eq 0 ]
 	echo "host zebra-host-01" >.devtools/literal.md
-	git ls-files --others --exclude-standard -z | xargs -0 git add --
+	git ls-files --others --exclude-standard -z >"$BATS_TEST_TMPDIR/files"
+	xargs -0 git add -- <"$BATS_TEST_TMPDIR/files"
 	run_check
 	[ "$status" -eq 1 ]
 	[[ $output == *".devtools/literal.md:1: private literal O11Y_PRIVATE_STRINGS entry 1"* ]]
@@ -334,7 +360,7 @@ run_check() {
 	git commit -q -m "chore: empty file"
 	run_check --range "$base..HEAD"
 	[ "$status" -eq 1 ]
-	[[ $output =~ path#[0-9a-f]{8}:path:\ private\ literal\ O11Y_PRIVATE_STRINGS\ entry\ 1 ]]
+	[[ $output =~ path#[0-9a-f]{8}:path:\ private\ literal\ O11Y_PRIVATE_STRINGS\ entry\ 6 ]]
 	no_value "kestrel99"
 }
 
@@ -494,7 +520,8 @@ run_check() {
 	git add .
 	run_check --staged
 	[ "$status" -eq 1 ]
-	[ "$(grep -c 'private literal' <<<"$output")" -eq 1 ]
+	count=$(grep -c 'private literal' <<<"$output")
+	[ "$count" -eq 1 ]
 	rm -f a* b*
 	git rm -q --cached -f a* b* 2>/dev/null || true
 	run_check --staged
@@ -723,7 +750,8 @@ leaky_history() {
 	echo "another host zebra-host-01" >new2.md
 	git add new2.md
 	git commit -q -m "chore: new leak"
-	lines "refs/heads/f $(git rev-parse HEAD) refs/heads/f $zero"
+	ref=$(git rev-parse HEAD)
+	lines "refs/heads/f $ref refs/heads/f $zero"
 	[ "$status" -eq 1 ]
 	[[ $output == *"new2.md:1: private literal O11Y_PRIVATE_STRINGS entry 1"* ]]
 }
@@ -755,7 +783,8 @@ leaky_history() {
 	echo ok >a.md
 	git add a.md
 	git commit -q -m "chore: ok"
-	lines "refs/heads/zebra-host-01-fix $(git rev-parse HEAD) refs/heads/zebra-host-01-fix $zero"
+	ref=$(git rev-parse HEAD)
+	lines "refs/heads/zebra-host-01-fix $ref refs/heads/zebra-host-01-fix $zero"
 	[ "$status" -eq 1 ]
 	[[ $output =~ path#[0-9a-f]{8}:path:\ private\ literal\ O11Y_PRIVATE_STRINGS\ entry\ 1 ]]
 }
@@ -781,7 +810,8 @@ leaky_history() {
 	git add c.md
 	git commit -q -m "chore: c"
 	oid=$(git rev-parse HEAD:c.md)
-	rm "$(git rev-parse --git-path "objects/${oid:0:2}/${oid:2}")"
+	object=$(git rev-parse --git-path "objects/${oid:0:2}/${oid:2}")
+	rm "$object"
 	run_check --range "$base..HEAD"
 	[ "$status" -eq 2 ]
 	[[ $output == *"incomplete"* ]]
@@ -793,7 +823,8 @@ leaky_history() {
 	git commit -q -m "chore: ok"
 	git tag -a -m "outer zebra-host-01" t1
 	git tag -a -m "nested" t2 t1 2>/dev/null
-	lines "refs/tags/t2 $(git rev-parse t2) refs/tags/t2 $zero"
+	ref=$(git rev-parse t2)
+	lines "refs/tags/t2 $ref refs/tags/t2 $zero"
 	[ "$status" -eq 1 ]
 	[[ $output == *"tag "*"private literal O11Y_PRIVATE_STRINGS entry 1"* ]]
 }
@@ -805,12 +836,18 @@ leaky_history() {
 hook_repo() {
 	command -v prek >/dev/null
 	command -v mise >/dev/null
-	mkdir -p .devtools/scripts
+	mkdir -p .devtools/scripts .devtools/tasks
 	cp "$checker" .devtools/scripts/check-leaks.sh
 	cp "$BATS_TEST_DIRNAME/install-pre-push.sh" .devtools/scripts/install-pre-push.sh
-	# The real task definition, so the hook runs the entry the repository ships.
-	awk '/^\["devtools:lint-leaks"\]/ { f = 1 } f && /^$/ { exit } f { print }' "$repo_root/.devtools/tasks/leaks.toml" | sed 's/^\["devtools:/[tasks."devtools:/' >mise.toml
-	[[ -s mise.toml ]]
+	# Exercise the published setup, including consumers without the leak tasks.
+	cp "$repo_root/.devtools/tasks/"{git-hooks,leaks}.toml .devtools/tasks/
+	printf '[task_config]\nincludes = [".devtools/tasks/git-hooks.toml"' >mise.toml
+	if [[ ${1-} != without-leaks ]]; then printf ', ".devtools/tasks/leaks.toml"' >>mise.toml; fi
+	printf ']\n[tools]\n' >>mise.toml
+	awk '/^prek =/ { print }' "$repo_root/.config/mise/conf.d/10-devtools-tools.toml" >>mise.toml
+	# The fixture's pin needs the published lock even when CI requires locked tools.
+	cp "$repo_root/.config/mise/mise.lock" mise.lock
+	export MISE_LOCKED=1
 	export DEVTOOLS_DIR="$work/.devtools"
 	mise trust -q "$work/mise.toml"
 	cat >.pre-commit-config.yaml <<YAML
@@ -826,15 +863,16 @@ repos:
         always_run: true
         pass_filenames: false
 YAML
-	git ls-files --others --exclude-standard -z | xargs -0 git add --
+	git ls-files --others --exclude-standard -z >"$BATS_TEST_TMPDIR/files"
+	xargs -0 git add -- <"$BATS_TEST_TMPDIR/files"
 	git commit -q -m "chore: hook"
 	git init -q --bare "$work/A.git"
 	git init -q --bare "$work/B.git"
 	git remote add origin "$work/A.git"
 	git push -q origin main
 	git config --unset core.hooksPath
-	prek install -t pre-push >/dev/null 2>&1
-	bash .devtools/scripts/install-pre-push.sh >/dev/null
+	mise run devtools:prek-install
+	if [[ ${1-} != without-leaks ]]; then mise run devtools:install-leak-hook >/dev/null; fi
 	rm -f "$BATS_TEST_TMPDIR/prek-ran"
 }
 
@@ -849,9 +887,14 @@ push_blocked() {
 	[ "$status" -ne 0 ]
 	# Only the check's own lines are ours; git prints ref names itself.
 	# A negated command that isn't the last line asserts nothing in bats.
-	if grep -E 'check-leaks|private literal|pattern:' <<<"$output" | grep -qF -e zebra-host-01 -e kestrel99; then
+	matches=$(grep -E 'check-leaks|private literal|pattern:' <<<"$output" || true)
+	if grep -qF -e zebra-host-01 -e kestrel99 <<<"$matches"; then
 		return 1
 	fi
+}
+
+v012_wrapper() {
+	sed 's/# devtools pre-push wrapper /# check-leaks pre-push wrapper /' "$1" >"$2"
 }
 
 @test "a clean push passes through the wrapper to prek's hook" {
@@ -877,7 +920,8 @@ push_blocked() {
 	push_blocked origin clean leaky
 	[[ $output == *"private literal O11Y_PRIVATE_STRINGS entry 1"* ]]
 	push_blocked origin leaky clean
-	[ -z "$(git ls-remote origin refs/heads/clean refs/heads/leaky)" ]
+	refs=$(git ls-remote origin refs/heads/clean refs/heads/leaky)
+	[ -z "$refs" ]
 	[ ! -f "$BATS_TEST_TMPDIR/prek-ran" ]
 }
 
@@ -886,7 +930,8 @@ push_blocked() {
 	git tag -a -m "release for zebra-host-01" v1
 	push_blocked origin v1
 	[[ $output == *"private literal O11Y_PRIVATE_STRINGS entry 1"* ]]
-	[ -z "$(git ls-remote origin refs/tags/v1)" ]
+	refs=$(git ls-remote origin refs/tags/v1)
+	[ -z "$refs" ]
 	git tag -d v1 >/dev/null
 	git tag -a -m "clean release" v1
 	push_ok origin v1
@@ -916,7 +961,8 @@ push_blocked() {
 	git commit -q -m "chore: clean child"
 	git remote set-url origin "$work/B.git"
 	push_blocked origin work
-	[ -z "$(git ls-remote "$work/B.git")" ]
+	refs=$(git ls-remote "$work/B.git")
+	[ -z "$refs" ]
 }
 
 @test "the hook covers every push URL of a remote" {
@@ -932,7 +978,8 @@ push_blocked() {
 	git remote set-url --push origin "$work/A.git"
 	git remote set-url --add --push origin "$work/B.git"
 	push_blocked origin work
-	[ -z "$(git ls-remote "$work/B.git")" ]
+	refs=$(git ls-remote "$work/B.git")
+	[ -z "$refs" ]
 }
 
 @test "the hook scans author and committer lines" {
@@ -968,7 +1015,8 @@ push_blocked() {
 	git add c.md
 	git commit -q -m "chore: c"
 	oid=$(git rev-parse HEAD:c.md)
-	rm "$(git rev-parse --git-path "objects/${oid:0:2}/${oid:2}")"
+	object=$(git rev-parse --git-path "objects/${oid:0:2}/${oid:2}")
+	rm "$object"
 	push_blocked origin work
 	[[ $output == *"incomplete"* ]]
 }
@@ -996,7 +1044,8 @@ push_blocked() {
 	git switch -q -c old
 	rm .devtools/scripts/check-leaks.sh
 	echo "host zebra-host-01" >l.md
-	git ls-files --others --exclude-standard -z | xargs -0 git add --
+	git ls-files --others --exclude-standard -z >"$BATS_TEST_TMPDIR/files"
+	xargs -0 git add -- <"$BATS_TEST_TMPDIR/files"
 	git commit -q -m "chore: no checker here"
 	push_ok origin old
 	[[ $output == *"leak check is not present on this branch and was skipped"* ]]
@@ -1011,7 +1060,8 @@ push_blocked() {
 
 @test "the check doesn't echo the arguments mise is given" {
 	command -v mise >/dev/null
-	awk '/^\["devtools:lint-leaks"\]/ { f = 1 } f && /^$/ { exit } f { print }' "$repo_root/.devtools/tasks/leaks.toml" | sed 's/^\["devtools:/[tasks."devtools:/' >mise.toml
+	task=$(awk '/^\["devtools:lint-leaks"\]/ { f = 1 } f && /^$/ { exit } f { print }' "$repo_root/.devtools/tasks/leaks.toml")
+	sed 's/^\["devtools:/[tasks."devtools:/' <<<"$task" >mise.toml
 	sed -i.bak "s|\$DEVTOOLS_DIR/scripts/check-leaks.sh|$checker|" mise.toml
 	export DEVTOOLS_DIR="$repo_root/.devtools"
 	mise trust -q "$work/mise.toml"
@@ -1023,10 +1073,22 @@ push_blocked() {
 
 # --- the installer ---------------------------------------------------------------
 
+@test "a consumer without leak tasks can push after prek-install" {
+	hook_repo without-leaks
+	echo clean >clean.txt
+	git add clean.txt
+	git -c core.hooksPath=/dev/null commit -q -m "chore: clean"
+	push_ok origin main
+	[ -f "$BATS_TEST_TMPDIR/prek-ran" ]
+	hooks=$(git rev-parse --git-path hooks)
+	grep -qF 'File generated by prek' "$hooks/pre-push"
+	[ ! -e "$hooks/pre-push.prek" ]
+}
+
 @test "the installer puts the wrapper in front of prek's hook, and reinstalling keeps it" {
 	hook_repo
 	hooks=$(git rev-parse --git-path hooks)
-	grep -qF 'check-leaks pre-push wrapper' "$hooks/pre-push"
+	grep -qF 'devtools pre-push wrapper' "$hooks/pre-push"
 	grep -qF 'File generated by prek' "$hooks/pre-push.prek"
 	bash .devtools/scripts/install-pre-push.sh --check
 	bash .devtools/scripts/install-pre-push.sh >/dev/null
@@ -1040,6 +1102,105 @@ push_blocked() {
 	[ ! -e "$hooks/pre-push.legacy" ]
 }
 
+@test "the installer upgrades a v0.12 wrapper left behind by prek" {
+	hook_repo
+	hooks=$(git rev-parse --git-path hooks)
+	v012_wrapper "$hooks/pre-push" "$BATS_TEST_TMPDIR/v0.12-pre-push"
+	cp "$BATS_TEST_TMPDIR/v0.12-pre-push" "$hooks/pre-push"
+	prek install -t pre-push >/dev/null 2>&1
+	grep -qF 'check-leaks pre-push wrapper' "$hooks/pre-push.legacy"
+
+	bash .devtools/scripts/install-pre-push.sh >/dev/null
+	[ ! -e "$hooks/pre-push.legacy" ]
+	echo clean >clean.txt
+	git add clean.txt
+	git -c core.hooksPath=/dev/null commit -q -m "chore: clean"
+	unset O11Y_PRIVATE_STRINGS
+	push_ok origin main
+	[ "$(grep -cF 'no private values loaded' <<<"$output")" -eq 1 ]
+	[ -f "$BATS_TEST_TMPDIR/prek-ran" ]
+}
+
+@test "the installer leaves a foreign pre-push legacy hook alone" {
+	hook_repo
+	hooks=$(git rev-parse --git-path hooks)
+	prek install -t pre-push >/dev/null 2>&1
+	printf '%s\n' '#!/bin/sh' 'echo foreign' >"$hooks/pre-push.legacy"
+
+	bash .devtools/scripts/install-pre-push.sh >/dev/null
+	[ "$(cat "$hooks/pre-push.legacy")" = $'#!/bin/sh\necho foreign' ]
+}
+
+@test "the installer check fails on a stale v0.12 legacy wrapper" {
+	hook_repo
+	hooks=$(git rev-parse --git-path hooks)
+	v012_wrapper "$hooks/pre-push" "$hooks/pre-push.legacy"
+
+	run bash .devtools/scripts/install-pre-push.sh --check
+	[ "$status" -eq 1 ]
+}
+
+@test "the wrapper gives commit-lint the original pre-push ranges" {
+	hook_repo
+	cat >>.pre-commit-config.yaml <<'YAML'
+      - id: commit-msg-pre-push
+        name: commit-msg-pre-push
+        entry: true
+        language: system
+        stages: [pre-push]
+        always_run: true
+        pass_filenames: false
+YAML
+	bash .devtools/scripts/install-pre-push.sh >/dev/null
+	mkdir -p "$BATS_TEST_TMPDIR/bin"
+	cat >"$BATS_TEST_TMPDIR/bin/commit-lint" <<'HOOK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >"$BATS_TEST_TMPDIR/commit-lint.args"
+cat >"$BATS_TEST_TMPDIR/commit-lint.input"
+exit 1
+HOOK
+	chmod +x "$BATS_TEST_TMPDIR/bin/commit-lint"
+	git switch -q -c blocked
+	echo blocked >blocked.txt
+	git add blocked.txt
+	git -c core.hooksPath=/dev/null commit -q -m "chore: blocked"
+
+	PATH="$BATS_TEST_TMPDIR/bin:$PATH" run git push origin blocked
+
+	[ "$status" -ne 0 ]
+	[ "$(cat "$BATS_TEST_TMPDIR/commit-lint.args")" = "--pre-push origin" ]
+	grep -q '^refs/heads/blocked ' "$BATS_TEST_TMPDIR/commit-lint.input"
+	[ ! -f "$BATS_TEST_TMPDIR/prek-ran" ]
+}
+
+@test "the wrapper names the required mise pin before reading stdin" {
+	hook_repo
+	cat >>.pre-commit-config.yaml <<'YAML'
+      - id: commit-msg-pre-push
+        name: commit-msg-pre-push
+        entry: true
+        language: system
+        stages: [pre-push]
+        always_run: true
+        pass_filenames: false
+YAML
+	bash .devtools/scripts/install-pre-push.sh >/dev/null
+	hooks=$(git rev-parse --git-path hooks)
+	mkdir -p "$BATS_TEST_TMPDIR/no-commit-lint"
+	cat >"$BATS_TEST_TMPDIR/no-commit-lint/cat" <<'STUB'
+#!/bin/sh
+touch "$BATS_TEST_TMPDIR/stdin-read"
+exit 0
+STUB
+	chmod +x "$BATS_TEST_TMPDIR/no-commit-lint/cat"
+
+	PATH="$BATS_TEST_TMPDIR/no-commit-lint:/usr/bin:/bin" run "$hooks/pre-push" origin
+
+	[ "$status" -eq 1 ]
+	[ "$output" = 'pre-push: commit-lint is not installed; add "go:github.com/tbhb-dev/devtools/cmd/commit-lint" = "<devtools-version>" to mise.toml [tools]' ]
+	[ ! -e "$BATS_TEST_TMPDIR/stdin-read" ]
+}
+
 @test "the installer check fails without the wrapper, and is skipped in CI" {
 	hook_repo
 	hooks=$(git rev-parse --git-path hooks)
@@ -1048,6 +1209,44 @@ push_blocked() {
 	[ "$status" -eq 1 ]
 	CI=true run bash .devtools/scripts/install-pre-push.sh --check
 	[ "$status" -eq 0 ]
+}
+
+@test "the installer check warns for missing or mismatched hooks only when requested" {
+	hook_repo
+	hooks=$(git rev-parse --git-path hooks)
+	for state in missing mismatched; do
+		if [[ $state == missing ]]; then
+			rm "$hooks/pre-push"
+		else
+			printf '#!/bin/sh\nexit 0\n' >"$hooks/pre-push"
+		fi
+		run bash .devtools/scripts/install-pre-push.sh --check
+		[ "$status" -eq 1 ]
+		DEVTOOLS_LEAK_HOOK_CHECK=warn run bash .devtools/scripts/install-pre-push.sh --check
+		[ "$status" -eq 0 ]
+		[[ $output == *"warning:"* ]]
+		DEVTOOLS_LEAK_HOOK_CHECK=other run bash .devtools/scripts/install-pre-push.sh --check
+		[ "$status" -eq 1 ]
+		CI=true DEVTOOLS_LEAK_HOOK_CHECK=warn run bash .devtools/scripts/install-pre-push.sh --check
+		[ "$status" -eq 0 ]
+		[ "$output" = 'install-pre-push: CI has no local hooks to check' ]
+	done
+}
+
+@test "the installer check handles an absent hooks directory" {
+	hook_repo
+	git config core.hooksPath "$work/absent-hooks"
+	run bash .devtools/scripts/install-pre-push.sh --check
+	[ "$status" -eq 1 ]
+	DEVTOOLS_LEAK_HOOK_CHECK=warn run bash .devtools/scripts/install-pre-push.sh --check
+	[ "$status" -eq 0 ]
+	[[ $output == *"warning:"* ]]
+	CI=true run bash .devtools/scripts/install-pre-push.sh --check
+	[ "$status" -eq 0 ]
+	[ "$output" = 'install-pre-push: CI has no local hooks to check' ]
+	DEVTOOLS_LEAK_HOOK_CHECK=warn run bash .devtools/scripts/install-pre-push.sh
+	[ "$status" -eq 1 ]
+	[ ! -e "$work/absent-hooks" ]
 }
 
 @test "the installer check fails when reading the hook prints it and then fails" {
@@ -1088,7 +1287,8 @@ push_blocked() {
 	mkdir -p .agents
 	echo "connect 10.21.32.43" >.agents/example.txt
 	cp .agents/example.txt deployment.txt
-	git ls-files --others --exclude-standard -z | xargs -0 git add --
+	git ls-files --others --exclude-standard -z >"$BATS_TEST_TMPDIR/files"
+	xargs -0 git add -- <"$BATS_TEST_TMPDIR/files"
 	git commit -q -m "chore: reuse"
 	run_check --range "$base..HEAD"
 	[ "$status" -eq 1 ]
@@ -1099,7 +1299,8 @@ push_blocked() {
 	mkdir -p .agents .devtools
 	echo "connect 10.21.32.43" >.agents/example.txt
 	cp .agents/example.txt .devtools/example.txt
-	git ls-files --others --exclude-standard -z | xargs -0 git add --
+	git ls-files --others --exclude-standard -z >"$BATS_TEST_TMPDIR/files"
+	xargs -0 git add -- <"$BATS_TEST_TMPDIR/files"
 	git commit -q -m "chore: exempt only"
 	run_check --range "$base..HEAD"
 	[ "$status" -eq 0 ]
@@ -1111,7 +1312,8 @@ push_blocked() {
 	git switch -q -c work
 	echo "connect 10.21.32.43" >.agents/example.txt
 	cp .agents/example.txt deployment.txt
-	git ls-files --others --exclude-standard -z | xargs -0 git add --
+	git ls-files --others --exclude-standard -z >"$BATS_TEST_TMPDIR/files"
+	xargs -0 git add -- <"$BATS_TEST_TMPDIR/files"
 	git commit -q -m "chore: reuse"
 	push_blocked origin work
 	[[ $output == *"pattern: private IPv4 address"* ]]
@@ -1160,7 +1362,8 @@ fake() {
 	fake cat "$real_cat >/dev/null; exit 1"
 	push_blocked origin work
 	[[ $output == *"could not read the push from git"* ]]
-	[ -z "$(git ls-remote "$work/A.git" refs/heads/work)" ]
+	refs=$(git ls-remote "$work/A.git" refs/heads/work)
+	[ -z "$refs" ]
 }
 
 @test "an unreadable private-literals file fails the scan instead of passing it" {
@@ -1194,7 +1397,8 @@ fake() {
 	printf 'unrelated\n' >"$hooks/pre-push.prek"
 	run bash .devtools/scripts/install-pre-push.sh
 	[ "$status" -eq 1 ]
-	[ "$(cat "$hooks/pre-push.prek")" = unrelated ]
+	hook=$(cat "$hooks/pre-push.prek")
+	[ "$hook" = unrelated ]
 }
 
 @test "private key headers are findings without their text" {
@@ -1239,4 +1443,66 @@ fake() {
 	run_check sample.txt
 	[ "$status" -eq 2 ]
 	[[ $output != *"sensitive-allow"* ]]
+}
+
+@test "working-tree skips vendor contents before any content read" {
+	mkdir vendor bin
+	local i
+	for i in {1..100}; do echo mango-secret >"vendor/$i"; done
+	printf '# vendor dependencies\n\n   \n^vendor/\n' >.leak-skip
+	git add -- vendor .leak-skip
+	# tr is the first content reader; record invocations without changing input.
+	local real_tr
+	real_tr=$(command -v tr)
+	printf '#!/usr/bin/env bash\necho read >>"$READ_LOG"\nexec "%s" "$@"\n' "$real_tr" >bin/tr
+	chmod +x bin/tr
+	export READ_LOG="$BATS_TEST_TMPDIR/reads"
+	export PATH="$work/bin:$PATH"
+	printf 'bin/\n' >>.gitignore
+	run_check
+	[ "$status" -eq 0 ]
+	# Only .gitignore, .leak-allow and .leak-skip are read (twice each).
+	[ "$(wc -l <"$READ_LOG")" -eq 6 ]
+	rm .leak-skip
+	run_check
+	[ "$status" -eq 1 ]
+}
+
+@test "skip configuration never exempts staged range push or explicit files" {
+	mkdir vendor
+	echo mango-secret >vendor/dependency
+	printf '^vendor/\n[\n' >.leak-skip
+	git add -- vendor .leak-skip
+	run_check --staged
+	[ "$status" -eq 1 ]
+	run_check vendor/dependency
+	[ "$status" -eq 1 ]
+	git commit -qm 'test: dependency'
+	run_check --range "$base..HEAD"
+	[ "$status" -eq 1 ]
+	local head
+	head=$(git rev-parse HEAD)
+	printf 'refs/heads/main %s refs/heads/main %s\n' "$head" "$base" >"$BATS_TEST_TMPDIR/push"
+	run_check --pre-push <"$BATS_TEST_TMPDIR/push"
+	[ "$status" -eq 1 ]
+}
+
+@test "invalid and unanchored skip expressions fail without repeating them" {
+	local expression
+	for expression in '^[' 'vendor/'; do
+		printf '%s\n' "$expression" >.leak-skip
+		run_check
+		[ "$status" -eq 2 ]
+		[[ $output != *"$expression"* ]]
+	done
+}
+
+@test "working-tree scan finds its helper when invoked by basename" {
+	mkdir -p scripts
+	cp "$checker" "$BATS_TEST_DIRNAME/leak-skip.sh" scripts/
+	printf 'scripts/\n' >>.gitignore
+	cd scripts
+	run bash check-leaks.sh
+	[ "$status" -eq 0 ]
+	[ -z "$output" ]
 }

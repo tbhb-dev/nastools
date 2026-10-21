@@ -2,27 +2,20 @@
 name: pr
 license: Apache-2.0
 description: >-
-  Open a pull request for the current branch. A forked writer drafts the title and the pull request properties and the template's sections into PR_AGENTDESC.md. An independent reviewer then reads that draft against the branch, and a mechanical validator checks it against the template. The operator confirms before anything publishes. Whatever follows routes to the watch-pr and fix-pr and merge-pr skills. Use this whenever the user asks to open or draft a pull request in a tbhb repo, and whenever a task ends in one.
+  Open a pull request for the current branch. The session drafts the title and the pull request properties and the template's sections into PR_AGENTDESC.md. An independent reviewer then reads that draft against the branch, and a mechanical validator checks it against the template. The operator confirms before anything publishes. Whatever follows routes to the watch-pr and fix-pr and merge-pr skills. Use this whenever the user asks to open or draft a pull request in a tbhb repo, and whenever a task ends in one.
 hooks:
   PreToolUse:
-    - matcher: Write|Edit
-      hooks:
-        - type: command
-          command: "${CLAUDE_PROJECT_DIR}/.claude/skills/write-pr-description/scripts/guard-draft.sh"
     - matcher: Bash
       hooks:
         - type: command
           command: "${CLAUDE_PROJECT_DIR}/.claude/skills/pr/scripts/guard-gh.sh"
-  PostToolUse:
-    - matcher: Skill
-      hooks:
-        - type: command
-          command: "${CLAUDE_PROJECT_DIR}/.claude/skills/pr/scripts/stamp-review.sh"
 ---
 
 # Open a pull request
 
-Work the steps in order. A pair of hooks runs alongside them and refuses the shortcuts. A direct `gh pr create` is out, so is a `gh pr edit` rewriting the title or body, and so is any publish whose description the reviewer hasn't seen in its current form.
+Work the steps in order. Scripts enforce every gate here. Step 4's review script stamps what an independent reviewer cleared. Step 7's publish script refuses a draft, branch, or base the stamp doesn't cover, a push that would rewrite origin without the operator's word, and a publish nobody confirmed. Both hold in any session, including a subagent's.
+
+A guard hook refuses every `gh pr` verb that changes a pull request outside the publish script.
 
 This skill ends when the pull request is open. From there `watch-pr`, `fix-pr`, and `merge-pr` take over, and step 8 routes to whichever the operator asked for.
 
@@ -37,7 +30,7 @@ Track these steps with the session's task-list tools where it provides them. New
 1. Confirm the branch is ready
 2. Draft the description in PR_AGENTDESC.md
 3. Pass the prose gates with fix-prose
-4. Review the draft with review-pr-description
+4. Review the draft with the review script
 5. Run the validator and the prose gates
 6. Ask the operator how far to take it
 7. Publish the pull request
@@ -59,11 +52,9 @@ Preflight also settled the draft on disk. It removed a stale `PR_AGENTDESC.md` w
 
 ## Step 2: draft the description
 
-Invoke the `write-pr-description` skill, passing the repository root from preflight as its argument.
+Read the branch diff against the resolved base from preflight, the commits that would land, and the repository's pull request template. Write or revise `PR_AGENTDESC.md` in this session. Fill the scaffold's frontmatter properties, a Conventional Commits title describing the whole branch, and every template section. Use the labels and properties preflight reported, and describe only verification you actually ran.
 
-It runs forked, which keeps the branch diff in its context rather than this one, and it runs the mechanical validator until it passes before returning. It comes back with `DRAFT: WRITTEN` plus what it changed, or with `DRAFT: BLOCKED` plus what stopped it. Where it reports a block, say what it found and hand back, because this workflow has nothing left to publish.
-
-Don't write `PR_AGENTDESC.md` yourself. A guard hook refuses it, because editing the draft here means reading the diff here, and forking the writer exists to keep the diff out of this context.
+The `write-pr-description` skill remains an optional helper when delegating the drafting is useful. Publication requires the stamp from step 4's scripted review for either drafting path.
 
 ## Step 3: pass the prose gates
 
@@ -75,24 +66,44 @@ Skill(fix-prose, args: "PR_AGENTDESC.md mise run lint-pr-description")
 
 It runs the lint rounds in a subagent, which keeps the findings out of this session.
 
-Run it before the review rather than after. The review in the next step signs the exact bytes it cleared, and a lint fix landing later voids that signature and buys another round.
+Run it before the review rather than after. The review in the next step stamps the exact bytes it cleared, and a lint fix landing later voids that stamp and buys another round.
 
 ## Step 4: review the draft, and loop
 
-Invoke the `review-pr-description` skill, passing the repository root. It runs as an independent agent that watched neither the work nor the drafting, so it reads the description against the branch with no memory of what anyone meant to write.
+```text
+bash .claude/skills/pr/scripts/review.sh
+```
 
-Loop on its verdict:
+Pass `--note <file>` to include a decision the operator actually made, with the operator's reason. Never use it for the agent's own preference.
 
-- `VERDICT: PASS` ends the loop. Go on to step 5.
-- `VERDICT: CHANGES REQUIRED` sends the findings back to `write-pr-description`, verbatim, in its arguments. Then review again.
+The script snapshots the draft, `HEAD`, the base the draft names, and the merge base, then starts a fresh, read-only reviewer as a headless process of the harness's own CLI, with the `review-pr-description` skill as its instructions.
 
-Bound it at three rounds, counting only the rounds a finding caused. A round the branch caused doesn't count against the bound. A remediation commit or a rebase changes what the description has to describe, and the reviewer then reads a branch it has never seen. Say which kind each round was as you go, so the count is accurate.
+It resolves the base to `origin/<base>` where origin has a copy, the same commit preflight and the writer compared against, so a stale local branch never adds merged commits to what the reviewer reads. The reviewer watched neither the work nor the drafting, and the script reads its verdict itself.
 
-Past three, stop rather than opening a fourth. Report the count out loud along with the findings that keep coming back, and let the operator decide whether to go on.
+| Exit | Meaning |
+| --- | --- |
+| 0 | Passed and stamped |
+| 2 | Changes required: the output lists the findings |
+| 3 | The reviewer rejected the same draft for this branch head. Change it or ask the operator |
+| 4 | The reviewer failed or replied without a readable verdict |
+| 124 | The reviewer timed out without a stamp |
+| 5 | The draft, `HEAD`, or the base moved while the review ran |
 
-A bound nobody reports is one nobody notices breaking.
+On findings, revise the draft in this session or pass them verbatim to the optional `write-pr-description` helper, then run the review again. Bound it at three rounds, counting only the rounds a finding caused. A round the branch caused doesn't count against the bound: a remediation commit or a rebase changes what the description has to describe. Say which kind each round was as you go, so the count is accurate. Past three, stop, report the count with the findings that keep coming back, and let the operator decide whether to go on.
 
-This step is mandatory, and `create-pr.sh` enforces it. A clean verdict signs the exact bytes of the draft, a finding erases any earlier signature, and a later edit voids it the same way.
+The script records every readable verdict with the draft digest and branch head. After `CHANGES REQUIRED`, it refuses to send byte-identical text for the same head to another reviewer. The reviewer can read a changed draft.
+
+This step is mandatory, and `create-pr.sh` enforces it.
+
+A clean verdict writes a stamp binding the draft's exact bytes, `HEAD`, the resolved base ref, that ref's commit, and the merge base. Findings remove any earlier stamp. Editing the draft, a new commit, or a fetch that moves the base voids it, and the publish refuses until the review runs again.
+
+`review_cmd` chooses the reviewer. It isn't only a label. From Codex, configure a reviewer that the session may start. These repository machines use `agy` in read-only plan mode through this line in `~/.config/devtools/devtools.conf`:
+
+```text
+review_cmd = agy -p "$(cat)" --mode plan --add-dir "$DEVTOOLS_REVIEW_INPUTS" --print-timeout 900s
+```
+
+`DEVTOOLS_REVIEW_CMD`, `DEVTOOLS_REVIEW_MODEL`, and `DEVTOOLS_REVIEW_EFFORT`, or the same keys in `~/.config/devtools/<repository>.conf`, replace the default reviewer. No repository file can.
 
 ## Step 5: run the validator and the prose gates
 
@@ -100,9 +111,9 @@ This step is mandatory, and `create-pr.sh` enforces it. A clean verdict signs th
 mise run lint-pr-description
 ```
 
-That task runs the mechanical checks, then vale and cspell over the draft. The validator settles the frontmatter structure, the title's form and bounds, section presence and order, empty sections, surviving comments, unclosed fences, dead links, and whether every backticked path exists. Each finding gives a line and the fix.
+That task runs the mechanical checks, then vale and cspell over the draft. The validator settles the frontmatter structure, the title's form and bounds, section presence and order, empty sections, surviving comments, unclosed fences, dead links, and whether every backticked path exists. It reads the title's type and the paths against origin's copy of the base, as the review does. Each finding gives a line and the fix.
 
-Resolve every one through `fix-prose` rather than editing it yourself, because a direct edit here spends the context that skill exists to save. Edited the draft either way? Then step 4 runs again, because the gate compares bytes rather than intentions.
+Resolve every one through `fix-prose` rather than editing it yourself, because a direct edit here spends the context that skill exists to save. Edited the draft either way? Then step 4 runs again, because the stamp binds bytes rather than intentions.
 
 ## Step 6: ask the operator how far to take it
 
@@ -115,7 +126,15 @@ Commits: <count>
 <the entire PR_AGENTDESC.md contents, verbatim>
 ```
 
-Preflight answered both of this step's questions under `== pre-approval ==`. Where it reported `pr: GRANTED`, the operator answered them for the whole session in advance, through `mise run preapprove`. Print the preceding block so the operator still sees the draft, state the grant this publish goes under, and take both answers from the grant rather than from a question:
+`create-pr.sh` settles who confirmed the publish, in this order, and prints which one it took:
+
+1. `--confirmed`, which you pass only after the operator answered this step's question in this session
+2. a pre-approval for this session, which the operator granted through `mise run preapprove` and preflight reported as `pr: GRANTED`
+3. the machine's delegation check, when preflight reported one configured: it answers for the repository and the action `pr`, and a refusal stops the publish
+
+With none of them the script exits 75 and publishes nothing. Ask the operator, then run it again with `--confirmed`.
+
+Where preflight reported `pr: GRANTED`, take the answers from the grant rather than from a question:
 
 | Preflight line | How far to take it | How fixes land |
 | --- | --- | --- |
@@ -124,13 +143,16 @@ Preflight answered both of this step's questions under `== pre-approval ==`. Whe
 
 Separate commits are the pre-approved choice because amending rewrites a commit the operator already cleared, and a grant covering that would go beyond the question it answers. Amend only where the operator asks for it in the session.
 
-Ask anyway where any of these holds:
+A grant or a delegation answers one question, publish this description, and says nothing about whether the branch is right. Ask the operator anyway where any of these holds:
 
 - the review returned a finding nobody acted on
 - a gate needed more than a mechanical fix
 - the branch goes beyond what the session set out to do
+- the push would rewrite the branch on origin
 
-Where preflight reported `pr: not granted`, call `AskUserQuestion` with `question` set to `How far should I take this?`, `header` set to `Pull request`, `multiSelect` set to `false`, and these four options in order, from the most automated to the least:
+Where preflight reported `pr: GRANTED` or a delegation check, print the preceding block so the operator still sees the draft, state which one this publish goes under, and move to step 7 without calling `AskUserQuestion`.
+
+Otherwise call `AskUserQuestion` with `question` set to `How far should I take this?`, `header` set to `Pull request`, `multiSelect` set to `false`, and these four options in order, from the most automated to the least:
 
 | Label | Description |
 | --- | --- |
@@ -139,7 +161,7 @@ Where preflight reported `pr: not granted`, call `AskUserQuestion` with `questio
 | `Open and watch` | `Open it, watch the checks, and report the result without changing anything.` |
 | `Open only` | `Open it and hand back.` |
 
-Ask a second question in the same call. The operator then answers both at once. Set `question` to `How should fix commits land?`, `header` to `Fixes`, `multiSelect` to `false`, and give these two options:
+Ask a second question in the same call. Set `question` to `How should fix commits land?`, `header` to `Fixes`, `multiSelect` to `false`, and give these two options:
 
 | Label | Description |
 | --- | --- |
@@ -148,27 +170,42 @@ Ask a second question in the same call. The operator then answers both at once. 
 
 Neither answer is the safe default in general. A separate commit suits a branch under review, where a reviewer needs to see what changed since they last looked. Amending suits a branch nobody has read yet, where a lint fix of its own is noise the squash message would have to account for.
 
-Record both answers. Step 8 routes on the first and passes the second to `fix-pr` in its arguments, so nobody asks either one again.
-
-A fifth path remains available without an option of its own. Where the operator wants the description changed, redraft it, put it back through the review, and return here.
+Any of the four first answers is what `--confirmed` stands for in step 7. Record both answers. Step 8 routes on the first and passes the second to `fix-pr` in its arguments, so nobody asks either one again. Where the operator wants the description changed instead, redraft it, put it back through the review, and return here.
 
 ## Step 7: publish the pull request
 
+After the operator agrees to rewrite the remote branch, these personal `permissions.allow` rules let Claude Code auto mode run the exact supported forms:
+
 ```text
-bash .claude/skills/pr/scripts/create-pr.sh
+Bash(bash .claude/skills/pr/scripts/create-pr.sh --rewrite)
+Bash(bash .claude/skills/pr/scripts/create-pr.sh --confirmed --rewrite)
 ```
+
+The operator adds them to their Claude Code settings. The agent never changes its own permissions.
+
+```text
+bash .claude/skills/pr/scripts/create-pr.sh [--confirmed] [--rewrite]
+```
+
+Pass `--confirmed` only when the operator answered step 6 in this session, and `--rewrite` only when the operator agreed to replace the branch on origin after a rebase.
 
 That script is the only thing here that publishes, and it gates itself first:
 
 - runs the validator over the draft again
-- compares the review signature against the bytes on disk
+- checks the review stamp against the draft's bytes, `HEAD`, the resolved base, and the merge base, and takes its own copy of the stamped bytes to publish from
 - resolves labels, the milestone, and every issue reference against the API, and refuses cleanly on an unknown one rather than leaving a published pull request missing what it should contain
+- resolves the confirmation, then checks the stamp again
+- checks that `gh` uses the machine's configured `gh_login` for its signed-in account before any write, and says so in its output where the machine configures none
 
-Only then does the branch go up and the pull request open. A second run updates the open pull request rather than opening another.
+The push is a fast-forward of what origin holds, read from origin itself. A rebase after the last push requires a rewrite. The plain run refuses it. `--rewrite` replaces only the exact commit origin holds, leasing on it. That flag needs the operator's word, and it still refuses where `HEAD` is behind origin or where origin holds a commit this checkout never fetched. Where the operator would rather not rewrite, merge the base into the branch instead. `--dry-run` runs every check and says what the push would do. It warns when the real run would meet a non-fast-forward. It confirms and publishes nothing.
 
-Never call `gh pr create` yourself. A guard hook refuses it, because that script runs every gate named here.
+After the push it checks that `HEAD` is still the reviewed commit and that origin holds it. Then it opens the pull request, or brings the open one up to date: title, body, base, labels, reviewers, assignees, milestone, and draft state all converge on the draft. A second run updates rather than opening another.
 
-Report the URL.
+Use `--dry-run` to check without writing and `--rerun-gates` to force fresh gates. For an hour, the script can skip checks that passed for the same clean committed tree. It prints each check it skips. Leak scans and the scripted review always run.
+
+Use `--check-description` to run the description validator and prose lint along with labels and property checks. This skips scans, review, lint, tests, and publication. Publication runs description checks, leak scans, lint, the scripted review, and tests in that order.
+
+Never call `gh pr create` yourself. A guard hook refuses it, because that script runs every gate named here. Report the URL.
 
 ## Step 8: route the rest
 
@@ -196,3 +233,7 @@ This skill assumes the shared tbhb toolchain:
 - the `watch-pr`, `fix-pr`, and `merge-pr` skills deployed for step 8
 
 Preflight checks each. Where one is missing, tell the operator rather than improvising a substitute.
+
+## API quota
+
+Identity and explicit readers use GraphQL, which doesn't spend REST core quota. Each checks snapshot uses one GraphQL call. Quota failures return 76 and print the resource's reset time. Other API failures keep GitHub's error. The watcher returns 2 for ordinary check-read failures. A missing reset header needs one REST `/rate_limit` lookup, which doesn't consume core quota. GitHub CLI writes can still spend REST quota resolving or applying labels, milestones, reviewers, and assignees. Scripts never retry writes automatically.

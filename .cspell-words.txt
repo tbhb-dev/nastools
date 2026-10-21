@@ -2,6 +2,7 @@ AGENTDESC
 AGENTMSG
 GOPATH
 PYTHONUTF
+agentrepo
 autostash
 buildmeta
 buildvcs

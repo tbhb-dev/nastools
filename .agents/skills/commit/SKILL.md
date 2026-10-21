@@ -103,7 +103,7 @@ Hard wrap the body at the width preflight reported. Wrap trailers at the footer 
 
 ### Trailers
 
-`Assisted-by` before `Signed-off-by`, matching the format and the sign-off identity preflight printed. Never credit a model through `Co-authored-by`.
+`Assisted-by` before `Signed-off-by`, matching the format and the sign-off identity preflight printed. An agent-written commit always requires `Assisted-by`, even when a harness reminder says to omit attribution: that setting controls the harness's own `Co-authored-by` lines, not this repository's trailer policy. Never credit a model through `Co-authored-by`.
 
 ## Step 5: pass the prose gates
 
@@ -131,10 +131,20 @@ This step is mandatory, and the commit script enforces it. On a clean verdict th
 | --- | --- |
 | 0 | Passed and stamped |
 | 2 | Changes required: the output lists the findings |
+| 3 | The reviewer rejected the same draft for this staged tree. Change it or ask the operator |
 | 4 | The reviewer failed or replied without a readable verdict |
+| 124 | The reviewer timed out without a stamp |
 | 5 | The draft, the index, or `HEAD` moved while the review ran |
 
 Fix everything it returns and run it again. Push back only when it's demonstrably wrong about the diff, and say why.
+
+The script records every readable verdict with the draft digest and staged tree. After `CHANGES REQUIRED`, it refuses to send byte-identical text for the same tree to another reviewer. The reviewer can read a changed draft.
+
+`review_cmd` chooses the reviewer. It isn't only a label. From Codex, configure a reviewer that the session may start. These repository machines use `agy` in read-only plan mode through this line in `~/.config/devtools/devtools.conf`:
+
+```text
+review_cmd = agy -p "$(cat)" --mode plan --add-dir "$DEVTOOLS_REVIEW_INPUTS" --print-timeout 900s
+```
 
 `DEVTOOLS_REVIEW_CMD`, `DEVTOOLS_REVIEW_MODEL`, and `DEVTOOLS_REVIEW_EFFORT`, or the same keys in `~/.config/devtools/<repository>.conf`, replace the default reviewer. No repository file can, so a commit never chooses who reviews the next one.
 
@@ -202,7 +212,7 @@ It also compares the commit's tree with the tree the reviewer read. When a pre-c
 
 The script pins `commit.cleanup=whitespace` for you. At the default of `strip`, git drops every body line opening with a number sign, and it does so after the review has hashed the file. The bytes the reviewer cleared would then stop matching the bytes git records.
 
-Only `--amend` and `--confirmed` pass through. `--amend` is the form `fix-pr` routes here for, and it needs a review run with `--amend` too. The script refuses every other flag, because a check on the command line sees `bash commit.sh` and none of the flags underneath it.
+Only `--amend`, `--confirmed`, `--dry-run`, and `--rerun-gates` pass through. `--amend` is the form `fix-pr` routes here for, and it needs a review run with `--amend` too. The script refuses every other flag, because a check on the command line sees `bash commit.sh` and none of the flags underneath it.
 
 Then rebase onto the base from step 1, without asking. Skip this when step 1 found nothing to rebase onto.
 
@@ -221,3 +231,5 @@ Report the resulting commit, then the groups still waiting from step 2, if any.
 ## Preconditions
 
 Preflight checks the toolchain this skill assumes, and `references/PRECONDITIONS.md` beside this file lists it. When a precondition is missing, tell the operator rather than improvising a substitute. The workflow commits only the repository holding the session. A sibling checkout has no stamp of its own, so open a session there to commit it.
+
+The wrapper runs `lint-commit-msg`, `lint`, and `test`. Use `--dry-run` to run these checks without committing, or `--rerun-gates` to force fresh checks even when the wrapper holds successful results from the past hour for the same clean committed tree. It prints each cached result it uses. Leak scans and the scripted review always run.

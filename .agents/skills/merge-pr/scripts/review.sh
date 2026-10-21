@@ -4,10 +4,10 @@
 #
 # The script takes one snapshot first: a copy of the draft, and one gh
 # response for the pull request that names its head and base. The
-# title, the description, every commit message, and the changed files
-# come from that response, the diff and the base branch's commit are
-# read right after it, and all of it lands in a directory of this run's
-# own. The stamp binds the copy's bytes, the pull request number, the
+# title, description, and commit messages come from that response. The
+# diff and changed files come from local git objects fetched at the
+# pinned head and base commits. All inputs land in this run's directory.
+# The stamp binds the copy's bytes, the pull request number, the
 # head, the base branch, the commit the base pointed at, and any
 # operator note. Before stamping, the script reads the live pull request
 # again and refuses when the head, the base, or the base's commit moved,
@@ -21,8 +21,8 @@
 # Usage: review.sh [--note <file>] [number]
 #   number  defaults to the one the draft's subject names
 # Exit:  0 stamped, 2 changes required, 4 no readable verdict or the
-#        reviewer failed, 5 the draft or the pull request changed during
-#        the review, 1 refused before reviewing.
+#        reviewer failed, 75 waiting on required reviews, 5 the draft or
+#        the pull request changed during the review, 1 refused beforehand.
 set -euo pipefail
 
 # --- environment hardening -------------------------------------------
@@ -48,7 +48,10 @@ while [ $# -gt 0 ]; do
   --note)
     [ $# -ge 2 ] || dt_die "$usage"
     [ -f "$2" ] || dt_die "Operator note is not a file: $2"
-    note=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
+    note_dir=$(dirname "$2") || exit $?
+    note_name=$(basename "$2") || exit $?
+    note_dir=$(cd "$note_dir" && pwd) || exit $?
+    note=$note_dir/$note_name
     shift 2
     ;;
   -*) dt_die "$usage" ;;
@@ -63,6 +66,7 @@ done
 mp_need_tools
 root=$(dt_root)
 cd "$root"
+ma_context
 draft=$root/SQUASH_AGENTMSG
 [ -s "$draft" ] || dt_die "SQUASH_AGENTMSG is missing or empty. Run squash-message.sh and write the body first."
 drafted_for=$(head -n 1 "$draft" | sed -n 's/.*(#\([0-9][0-9]*\))[[:space:]]*$/\1/p')
@@ -77,14 +81,17 @@ esac
 # response, which names the head and the base it describes.
 inputs=$(dt_new_inputs squash)
 view=$inputs/pull-request.json
-mp_view "$number" "$view" number,title,body,state,baseRefName,headRefName,headRefOid,commits,files ||
-  dt_die "Could not read pull request #$number."
-[ "$(mp_field "$view" state)" = OPEN ] || dt_die "#$number is $(mp_field "$view" state), not OPEN."
+mp_view "$number" "$view" "$MA_GATE_FIELDS,number,title,body,headRefName,commits,reviewDecision" || exit $?
+pr_state=$(mp_field "$view" state) || exit $?
+[ "$pr_state" = OPEN ] || dt_die "#$number is $pr_state, not OPEN."
+mp_require_reviews "$view" "$number"
 head=$(mp_field "$view" headRefOid)
 base=$(mp_field "$view" baseRefName)
 [ -n "$head" ] && [ -n "$base" ] || dt_die "#$number names no head or no base."
-base_oid=$(mp_base_oid "$base") || dt_die "Could not read where $base points."
+if [ "${DT_UNATTENDED:-0}" = 1 ]; then ma_lint "$head"; fi
+base_oid=$(mp_base_oid "$base") || exit $?
 [ -n "$base_oid" ] || dt_die "Could not read where $base points."
+ma_gates "$view" "$number" "$base_oid"
 
 snapshot=$inputs/SQUASH_AGENTMSG
 cp "$draft" "$snapshot"
@@ -107,29 +114,39 @@ jq -r '.body // ""' "$view" >"$inputs/description.md"
 # loses.
 jq -r '.commits[] | "--- " + .oid + "\n" + .messageHeadline + "\n\n" + (.messageBody // "") + "\n"' \
   "$view" >"$inputs/commits.txt"
-jq -r '.files[]? | "\(.additions)+ \(.deletions)- \(.path)"' "$view" >"$inputs/files.txt"
 rm -f "$view"
-gh pr diff "$number" >"$inputs/change.diff" || dt_die "Could not read the diff of #$number."
-if [ -s "$inputs/files.txt" ] && [ ! -s "$inputs/change.diff" ]; then
-  dt_die "#$number names changed files, but its diff is empty; something is hiding the content."
-fi
+mp_local_diff "$base_oid" "$head" "$inputs"
+mergebase=$(gitr merge-base "$base_oid" "$head")
+gitr log --reverse --format='--- %H%n%B' "$mergebase..$head" >"$inputs/commits.txt"
 
 # shellcheck disable=SC2329 # dt_review calls it by name
 still_as_gathered() {
-  local live
+  local live live_base
   live=$(dt_state_dir)/squash.live.json
-  mp_view "$number" "$live" headRefOid,baseRefName || return 1
-  [ "$(mp_field "$live" headRefOid)" = "$head" ] &&
-    [ "$(mp_field "$live" baseRefName)" = "$base" ] &&
-    [ "$(mp_base_oid "$base")" = "$base_oid" ] &&
-    { [ "$note_digest" = none ] || [ "$(dt_digest "$inputs/operator-note.txt")" = "$note_digest" ]; }
+  mp_view "$number" "$live" headRefOid,baseRefName,reviewDecision || exit $?
+  mp_require_reviews "$live" "$number"
+  local live_head live_name
+  live_head=$(mp_field "$live" headRefOid) || return $?
+  live_name=$(mp_field "$live" baseRefName) || return $?
+  [ "$live_head" = "$head" ] && [ "$live_name" = "$base" ] || return 1
+  live_base=$(mp_base_oid "$base") || exit $?
+  [ "$live_base" = "$base_oid" ] &&
+    { [ "$note_digest" = none ] || {
+      local live_note_digest
+      live_note_digest=$(dt_digest "$inputs/operator-note.txt") || return $?
+      [ "$live_note_digest" = "$note_digest" ]
+    }; }
 }
+
+dt_review_policy "$inputs" "$head" "$head"
 
 criteria=$DT_LIB_DIR/../../review-squash-message/SKILL.md
 status=0
 dt_review squash "$draft" "$snapshot" "$criteria" "$root" "$inputs" still_as_gathered \
+  "pr:$number:$head" \
   pr "$number" head "$head" base "$base" base_oid "$base_oid" note "$note_digest" || status=$?
-rm -f "$(dt_state_dir)/squash.live.json"
+state=$(dt_state_dir) || exit $?
+rm -f "$state/squash.live.json"
 case $status in
 0) ;;
 2) printf '\nFix every finding in SQUASH_AGENTMSG, then run review.sh again.\n' ;;

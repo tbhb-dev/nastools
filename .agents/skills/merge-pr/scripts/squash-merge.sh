@@ -32,7 +32,7 @@
 # Usage: squash-merge.sh [--confirmed] [number]
 #   --confirmed  the operator answered yes to this merge in this session
 # Exit:  0 merged, 1 refused or failed, 75 held: nobody has confirmed the
-#        merge; ask, then pass --confirmed
+#        merge; ask, then pass --confirmed; or merge queued/pending
 set -euo pipefail
 
 # --- environment hardening -------------------------------------------
@@ -63,9 +63,15 @@ step() { printf '\n--- %s\n' "$1"; }
 usage="usage: squash-merge.sh [--confirmed] [number]"
 confirmed=false
 number=""
+expected_head=""
 for arg in "$@"; do
   case $arg in
   --confirmed) confirmed=true ;;
+  --expected-head=*)
+    expected_head=${arg#*=}
+    case $expected_head in "" | *[!0-9a-f]*) die "Expected head must be a full commit SHA" ;; esac
+    [ "${#expected_head}" -eq 40 ] || die "Expected head must be a full commit SHA"
+    ;;
   -* | *[!0-9]*) die "$usage" ;;
   *)
     [ -z "$number" ] || die "$usage"
@@ -74,15 +80,21 @@ for arg in "$@"; do
   esac
 done
 
+command -v commit-lint >/dev/null 2>&1 ||
+  die 'commit-lint is not installed; add "go:github.com/tbhb-dev/devtools/cmd/commit-lint" = "<devtools-version>" to mise.toml [tools]'
 mp_need_tools
 root=$(dt_root)
 cd "$root"
 state=$(dt_state_dir)
+ma_context
+if [ "${DT_UNATTENDED:-0}" = 1 ] && [ "$confirmed" = true ]; then
+  die "Unattended workflows refuse --confirmed; use pre-approval or delegation."
+fi
 here=$DT_LIB_DIR
 
 branch=$(gitr rev-parse --abbrev-ref HEAD)
 if [ -z "$number" ]; then
-  number=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+  number=$(dt_gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty') || exit $?
   [ -n "$number" ] || die "no open pull request for ${branch}. Pass a number explicitly."
 fi
 
@@ -102,11 +114,10 @@ printf 'drafted for #%s\n' "$number"
 view=$state/merge.view.json
 read_live() {
   mp_view "$number" "$view" \
-    state,isDraft,mergeable,mergeStateStatus,reviewDecision,headRefName,baseRefName,headRefOid,isCrossRepository,statusCheckRollup ||
-    die "cannot read pull request #${number}."
+    "$MA_GATE_FIELDS,reviewDecision,headRefName,isCrossRepository" || exit $?
   head_oid=$(mp_field "$view" headRefOid)
   base_ref=$(mp_field "$view" baseRefName)
-  base_oid=$(mp_base_oid "$base_ref") || die "cannot read where ${base_ref} points."
+  base_oid=$(mp_base_oid "$base_ref") || exit $?
 }
 
 require_reviewed() {
@@ -126,6 +137,7 @@ step "checking the review stamp"
 read_live
 require_reviewed
 reviewed_head=$(dt_stamp_value squash head)
+[ -z "$expected_head" ] || [ "$expected_head" = "$reviewed_head" ] || die "Expected head differs from the reviewed head"
 printf 'reviewed at head %s, onto %s at %s\n' "$reviewed_head" "$base_ref" "$base_oid"
 
 # --- gate 3: the account gh acts as ----------------------------------
@@ -139,7 +151,7 @@ want_login=$(dt_conf gh_login)
 if [ -z "$want_login" ]; then
   printf 'gh_login is not configured; skipping the account check\n'
 else
-  login=$(gh api user --jq .login 2>/dev/null) || die "gh could not say which account it is signed in as."
+  login=$(dt_gh_login) || exit $?
   [ "$login" = "$want_login" ] ||
     die "gh is signed in as ${login:-nobody}, not the configured ${want_login}. Nothing was merged."
   printf 'signed in as %s\n' "$login"
@@ -157,7 +169,10 @@ step "checking #${number}"
 wait_limit=${MERGE_MERGEABLE_WAIT:-60}
 poll_every=${MERGE_MERGEABLE_POLL:-3}
 waited=0
-while [ "$(mp_field "$view" mergeable)" = UNKNOWN ] || [ "$(mp_field "$view" mergeStateStatus)" = UNKNOWN ]; do
+while :; do
+  mergeable=$(mp_field "$view" mergeable) || exit $?
+  merge_state=$(mp_field "$view" mergeStateStatus) || exit $?
+  [ "$mergeable" = UNKNOWN ] || [ "$merge_state" = UNKNOWN ] || break
   [ "$waited" -lt "$wait_limit" ] ||
     die "#${number} still reports its mergeability as UNKNOWN after ${wait_limit}s. Try again shortly."
   [ "$waited" -gt 0 ] || printf 'GitHub is still computing mergeability; waiting up to %ss\n' "$wait_limit"
@@ -169,17 +184,14 @@ done
 
 pr_state=$(mp_field "$view" state)
 [ "$pr_state" = OPEN ] || die "#${number} is ${pr_state}, not OPEN."
-[ "$(mp_field "$view" isDraft)" = false ] || die "#${number} is a draft. Mark it ready before merging."
+is_draft=$(mp_field "$view" isDraft) || exit $?
+[ "$is_draft" = false ] || die "#${number} is a draft. Mark it ready before merging."
 mergeable=$(mp_field "$view" mergeable)
 [ "$mergeable" = MERGEABLE ] || die "#${number} is not mergeable (${mergeable:-unknown})."
+mp_require_reviews "$view" "$number"
 merge_state=$(mp_field "$view" mergeStateStatus)
 [ "$merge_state" = CLEAN ] ||
   die "#${number} is not ready to merge (${merge_state:-unknown}). BEHIND or DIRTY goes to the rebase skill."
-review_decision=$(mp_field "$view" reviewDecision)
-case ${review_decision:-NONE} in
-APPROVED | NONE) ;;
-*) die "#${number} review decision is ${review_decision}, not approved." ;;
-esac
 cross_repo=$(mp_field "$view" isCrossRepository)
 case $cross_repo in
 true | false) ;;
@@ -210,11 +222,15 @@ printf 'open, ready, mergeable, and green\n'
 # There is no fallback: without the task, nothing merges.
 
 step "running the commit-msg gates"
-command -v mise >/dev/null 2>&1 || die "mise is not installed; the squash-message gate cannot run."
-mise task info lint-squash-msg >/dev/null 2>&1 ||
-  die "mise run lint-squash-msg is absent; the squash-message gate cannot run."
-mise run lint-squash-msg ||
+if [ "${DT_UNATTENDED:-0}" != 1 ]; then
+  command -v mise >/dev/null 2>&1 || die "mise is not installed; the squash-message gate cannot run."
+  mise task info lint-squash-msg >/dev/null 2>&1 ||
+    die "mise run lint-squash-msg is absent; the squash-message gate cannot run."
+fi
+ma_lint "$reviewed_head" ||
   die "the squash message fails the commit-msg gates. Fix it, review it again, retry."
+commit-lint --rules trailers --require-assisted-from "$base_oid..$reviewed_head" "$SQUASH_DRAFT" ||
+  die "the squash message lacks attribution required by the commits it collapses. Fix it, review it again, retry."
 
 # --- gate 6: somebody confirmed the merge ----------------------------
 #
@@ -222,9 +238,15 @@ mise run lint-squash-msg ||
 # merge pre-approval has to name merge, because it is the one action
 # here that no later step can walk back.
 
+ma_gates "$view" "$number" "$base_oid"
+
 step "confirming"
 status=0
-dt_confirm merge "$confirmed" || status=$?
+set --
+if [ "${DT_UNATTENDED:-0}" = 1 ] && jq -e '.owner_paths | length > 0' "$state/merge.policy.json" >/dev/null; then
+  set -- --owner-path
+fi
+dt_confirm merge "$confirmed" "$@" || status=$?
 case $status in
 0) ;;
 1) exit 1 ;;
@@ -236,20 +258,72 @@ esac
 # from a copy of the bytes the stamp covers.
 read_live
 require_reviewed
+ma_gates "$view" "$number" "$base_oid"
+
+# --- merge -----------------------------------------------------------
+
+head_ref=$(mp_field "$view" headRefName)
+ma_prepare_children
+# Retargeting children is another write: pin and judge the live state again.
+if [ "${DT_UNATTENDED:-0}" = 1 ]; then
+  read_live
+  require_reviewed
+  ma_gates "$view" "$number" "$base_oid"
+  # Readiness is repository code. Re-read live approvals and checks after it.
+  read_live
+  require_reviewed
+  ma_gates "$view" "$number" "$base_oid" true
+  require_reviewed
+fi
 message=$state/merge.message
 cp "$SQUASH_DRAFT" "$message"
-[ "$(dt_digest "$message")" = "$(dt_stamp_value squash draft)" ] ||
+message_digest=$(dt_digest "$message") || exit $?
+reviewed_digest=$(dt_stamp_value squash draft) || exit $?
+[ "$message_digest" = "$reviewed_digest" ] ||
   die "${SQUASH_DRAFT} changed while it was being copied. Review it again."
 subject=$(head -1 "$message")
 body=$state/merge.body
 awk 'NR > 1' "$message" | awk 'NF { seen = 1 } seen' >"$body"
 [ -s "$body" ] || die "the message has a subject and no body; a squash message says why."
 
-# --- merge -----------------------------------------------------------
-
 step "squashing #${number} into ${base_ref}"
-gh pr merge "$number" --squash --match-head-commit "$reviewed_head" \
-  --subject "$subject" --body-file "$body"
+merge_status=0
+dt_gh pr merge "$number" --squash --match-head-commit "$reviewed_head" \
+  --subject "$subject" --body-file "$body" || merge_status=$?
+
+# A successful command may only enqueue the merge, and an error may
+# follow a completed server-side merge. Read once; never repeat the write.
+result=$state/merge.result.json
+check_again="Check with: gh pr view $number --json state,headRefOid,mergeCommit"
+if ! mp_view "$number" "$result" state,headRefOid,mergeCommit,url; then
+  die "UNKNOWN: could not confirm #${number} after gh exited ${merge_status}. Drafts and stamps kept. $check_again"
+fi
+result_state=$(mp_field "$result" state) || die "UNKNOWN: invalid merge result. $check_again"
+result_head=$(mp_field "$result" headRefOid) || die "UNKNOWN: invalid merge result. $check_again"
+merge_commit=$(jq -r '.mergeCommit.oid // empty' "$result") || die "UNKNOWN: invalid merge result. $check_again"
+case $result_state in
+MERGED)
+  [ "$result_head" = "$reviewed_head" ] && [ -n "$merge_commit" ] ||
+    die "UNKNOWN: #${number} reports MERGED without the reviewed head and a merge commit. Drafts and stamps kept. $check_again"
+  printf 'MERGED: #%s at %s (gh exit %s); recorded in %s\n' "$number" "$merge_commit" "$merge_status" "$result"
+  ;;
+OPEN)
+  if [ "$merge_status" -eq 0 ]; then
+    printf 'PENDING: #%s is queued or pending. Drafts and stamps kept. %s\n' "$number" "$check_again"
+    exit "$DT_HELD"
+  fi
+  die "FAILED: gh exited ${merge_status} and #${number} remains OPEN. Drafts and stamps kept. $check_again"
+  ;;
+CLOSED)
+  die "FAILED: #${number} is CLOSED without merging. Drafts and stamps kept."
+  ;;
+*)
+  die "UNKNOWN: unexpected state ${result_state:-missing} for #${number}. Drafts and stamps kept. $check_again"
+  ;;
+esac
+
+ma_verify
+ma_report
 
 # --- clean up --------------------------------------------------------
 
@@ -271,7 +345,7 @@ printf 'removed %s and %s\n' "$SQUASH_DRAFT" "$DESC_DRAFT"
 # The remote branch goes; the local one may be the branch this worktree
 # stands on, and deleting that would strand the session. Say so instead.
 if [ "$cross_repo" = false ] && git ls-remote --exit-code --heads origin "$head_ref" >/dev/null 2>&1; then
-  if deleted=$(git push origin --delete "$head_ref" 2>&1); then
+  if deleted=$(git push --force-with-lease="refs/heads/$head_ref:$reviewed_head" origin ":refs/heads/$head_ref" 2>&1); then
     printf 'deleted origin/%s\n' "$head_ref"
   elif printf '%s\n' "$deleted" | grep -Fq 'remote ref does not exist'; then
     printf 'origin/%s was already deleted\n' "$head_ref"
@@ -286,10 +360,14 @@ if [ "$cross_repo" = true ]; then
 elif [ "$branch" = "$head_ref" ]; then
   printf '\nThis worktree still stands on %s, which has merged.\n' "$head_ref"
   printf 'Switch to %s before deleting it, or drop the whole worktree.\n' "$base_ref"
-elif gitr rev-parse --verify --quiet "refs/heads/$head_ref" >/dev/null; then
+elif [ "${DT_UNATTENDED:-0}" != 1 ] && gitr rev-parse --verify --quiet "refs/heads/$head_ref" >/dev/null; then
   git branch -D "$head_ref" >/dev/null 2>&1 &&
     printf 'deleted local %s\n' "$head_ref" || true
 fi
 
+if [ "${DT_UNATTENDED:-0}" = 1 ] && [ "$cross_repo" = false ]; then
+  disposable=$(dt_repo_conf disposable_ignored)
+  ma_policy cleanup "$base_ref" "$head_ref" "$reviewed_head" "$merge_commit" "$disposable" || printf 'Merged; local cleanup incomplete, inspect retained state.\n' >&2
+fi
 step "done"
-gh pr view "$number" --json url,state --jq '"merged: \(.url) (\(.state))"'
+jq -r '"merged: \(.url) (\(.state)), commit \(.mergeCommit.oid)"' "$result"
