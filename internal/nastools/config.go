@@ -91,7 +91,9 @@ func (c Config) validate() error {
 }
 
 func (e Endpoint) valid() bool {
-	if !strings.HasPrefix(e.Service, "svc:") || (e.HTTPS > 0) == (e.TCP > 0) || e.HTTPS < 0 || e.TCP < 0 {
+	const maxPort = 65535
+	if !strings.HasPrefix(e.Service, "svc:") || e.Service == "svc:" ||
+		(e.HTTPS > 0) == (e.TCP > 0) || e.HTTPS < 0 || e.TCP < 0 || e.HTTPS > maxPort || e.TCP > maxPort {
 		return false
 	}
 	u, err := url.Parse(e.Target)

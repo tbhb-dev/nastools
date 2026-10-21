@@ -30,8 +30,11 @@ func main() {
 type operations struct{}
 
 func (operations) ReadFile(path string) ([]byte, error) {
-	//nolint:wrapcheck // The policy replaces adapter errors with secret-safe diagnostics.
-	return os.ReadFile(filepath.Clean(path))
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return nil, fmt.Errorf("read: %w", nastools.ErrInvalid)
+	}
+	return data, nil
 }
 
 func (operations) GitState(ctx context.Context, dir string) (nastools.GitState, error) {
@@ -53,6 +56,8 @@ func (operations) Compose(ctx context.Context, args, env []string) error {
 	// All paths in the policy request are relative to the caller or absolute.
 	// Changing cmd.Dir here would resolve a relative config directory twice.
 	cmd.Env = env
-	//nolint:wrapcheck // The policy replaces adapter errors with secret-safe diagnostics.
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("compose: %w", nastools.ErrInvalid)
+	}
+	return nil
 }
