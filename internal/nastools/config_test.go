@@ -19,6 +19,10 @@ func TestConfigPolicy(t *testing.T) {
 		change func(*nastools.Config)
 		field  string
 	}{
+		{"project traversal", func(c *nastools.Config) { c.Project = "../example" }, "project"},
+		{"project shell", func(c *nastools.Config) { c.Project = "example;id" }, "project"},
+		{"lock directory missing", func(c *nastools.Config) { c.SSH.LockDir = "" }, "ssh.lock_dir"},
+		{"lock directory relative", func(c *nastools.Config) { c.SSH.LockDir = "locks" }, "ssh.lock_dir"},
 		{"project", func(c *nastools.Config) { c.Project = "" }, "project"},
 		{"compose absent", func(c *nastools.Config) { c.Compose = nil }, "compose"},
 		{"compose empty", func(c *nastools.Config) { c.Compose = []string{""} }, "compose"},

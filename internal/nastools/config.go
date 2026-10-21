@@ -14,8 +14,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -35,6 +38,7 @@ type SSH struct {
 	AddressEnv    string `toml:"address_env"`
 	UserEnv       string `toml:"user_env"`
 	KnownHostsEnv string `toml:"known_hosts_env"`
+	LockDir       string `toml:"lock_dir"`
 }
 
 type Endpoint struct {
@@ -57,8 +61,11 @@ func parse(data []byte) (Config, error) {
 }
 
 func (c Config) validate() error {
-	if c.Project == "" {
+	if !regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`).MatchString(c.Project) {
 		return fmt.Errorf("project: %w", ErrInvalid)
+	}
+	if !filepath.IsAbs(c.SSH.LockDir) {
+		return fmt.Errorf("ssh.lock_dir: %w", ErrInvalid)
 	}
 	if len(c.Compose) == 0 {
 		return fmt.Errorf("compose: %w", ErrInvalid)
@@ -117,7 +124,11 @@ func resolve(dir, path string) string {
 type Operations interface {
 	ReadFile(path string) ([]byte, error)
 	GitState(ctx context.Context, dir string) (GitState, error)
-	Compose(ctx context.Context, args, env []string) error
+	Compose(ctx context.Context, args, env []string, out, errOut io.Writer) error
+	Open(ctx context.Context, ssh SSH, env map[string]string) (string, error)
+	Lock(ctx context.Context, path string) error
+	Pause(ctx context.Context) error
+	Close()
 }
 
 type GitState struct {
@@ -232,7 +243,7 @@ func childEnvironment(env map[string]string) []string {
 	return result
 }
 
-func Check(ctx context.Context, ops Operations, path string, env map[string]string, out io.Writer) error {
+func Load(ops Operations, path string, env map[string]string, out io.Writer) (Config, error) {
 	data, readErr := ops.ReadFile(path)
 	c, err := parse(data)
 	// Mask even on read or parse failure, retaining any partially decoded input names.
@@ -240,25 +251,128 @@ func Check(ctx context.Context, ops Operations, path string, env map[string]stri
 		out,
 		MaskCommands(PrivateValues(c, env), env["GITHUB_ACTIONS"] != ""),
 	); writeErr != nil {
-		return fmt.Errorf("mask output: %w", ErrInvalid)
+		return c, fmt.Errorf("mask output: %w", ErrInvalid)
 	}
 	if readErr != nil {
-		return fmt.Errorf("nastools.toml: unreadable input: %w", ErrInvalid)
+		return c, fmt.Errorf("nastools.toml: unreadable input: %w", ErrInvalid)
 	}
-	if err != nil {
-		return err
-	}
-	inputs, err := Prepare(ctx, ops, path, c, env)
-	if err != nil {
-		return err
-	}
-	args := []string{"--project-directory", inputs.Dir, "--project-name", inputs.Config.Project}
+	return c, err
+}
+
+func compose(ctx context.Context, ops Operations, inputs Inputs, command []string, out, errOut io.Writer) error {
+	const fixedArgs = 4
+	args := make([]string, 0, fixedArgs+2*len(inputs.Config.Compose)+len(command))
+	args = append(args, "--project-directory", inputs.Dir, "--project-name", inputs.Config.Project)
 	for _, path := range inputs.Config.Compose {
 		args = append(args, "--file", resolve(inputs.Dir, path))
 	}
-	args = append(args, "config", "-q")
-	if composeErr := ops.Compose(ctx, args, inputs.Env); composeErr != nil {
-		return fmt.Errorf("compose config: %w", ErrInvalid)
+	if err := ops.Compose(ctx, append(args, command...), inputs.Env, out, errOut); err != nil {
+		return fmt.Errorf("compose %s: %w", command[0], ErrInvalid)
 	}
 	return nil
+}
+
+const (
+	CheckName = "check"
+	Deploy    = "deploy"
+	Logs      = "logs"
+)
+
+var ErrBusy = errors.New("deploy in progress")
+
+type Command struct {
+	Name     string
+	Service  string
+	Tail     int
+	Follow   bool
+	LockWait time.Duration
+}
+
+func Execute(ctx context.Context, ops Operations, path string, env map[string]string,
+	out, errOut io.Writer, command Command,
+) error {
+	config, err := Load(ops, path, env, out)
+	if err != nil {
+		return err
+	}
+	inputs, err := Prepare(ctx, ops, path, config, env)
+	if err != nil {
+		return err
+	}
+	if command.LockWait < 0 || command.Tail < 0 {
+		return ErrInvalid
+	}
+	if command.Name == Deploy || command.Name == CheckName {
+		err = compose(ctx, ops, inputs, []string{"config", "-q"}, nil, nil)
+	}
+	if err != nil || command.Name == CheckName {
+		return err
+	}
+
+	defer ops.Close() // Also cleans partially opened transports on error.
+	socket, err := ops.Open(ctx, inputs.Config.SSH, env)
+	if err != nil {
+		return fmt.Errorf("SSH transport: %w", ErrInvalid)
+	}
+	if command.Name == Deploy {
+		lock := filepath.Join(config.SSH.LockDir, config.Project+".lock")
+		if err = acquire(ctx, ops, lock, command.LockWait); err != nil {
+			return err
+		}
+	}
+	inputs.Env = append(slices.DeleteFunc(inputs.Env, func(entry string) bool {
+		name, _, _ := strings.Cut(entry, "=")
+		return slices.Contains(
+			[]string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"},
+			name,
+		)
+	}), "DOCKER_HOST=unix://"+socket)
+	for _, args := range command.arguments(inputs.Config.WaitSeconds) {
+		if err = compose(ctx, ops, inputs, args, out, errOut); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (command Command) arguments(wait int) [][]string {
+	switch command.Name {
+	case Deploy:
+		return [][]string{
+			{"pull", "--ignore-buildable"},
+			{"up", "--wait", "--wait-timeout", strconv.Itoa(wait), "--remove-orphans"},
+			{"ps"},
+		}
+	// F3 inserts provenance before pull and scoped Serve after readiness.
+	case "logs":
+		args := []string{"logs", "--tail", strconv.Itoa(command.Tail)}
+		if command.Follow {
+			args = append(args, "--follow")
+		}
+		if command.Service != "" {
+			args = append(args, "--", command.Service)
+		}
+		return [][]string{args}
+	}
+	return [][]string{{"ps"}}
+}
+
+func acquire(ctx context.Context, ops Operations, path string, wait time.Duration) error {
+	if wait > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, wait)
+		defer cancel()
+	}
+	for {
+		err := ops.Lock(ctx, path)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, ErrBusy) {
+			return fmt.Errorf("deploy lock: %w", ErrInvalid)
+		}
+		if wait == 0 || ops.Pause(ctx) != nil {
+			return fmt.Errorf("%w: %w", ErrBusy, ErrInvalid)
+		}
+	}
 }

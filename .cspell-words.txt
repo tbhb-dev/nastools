@@ -2,6 +2,7 @@ AGENTDESC
 AGENTMSG
 GOPATH
 PYTHONUTF
+RSASHA
 agentrepo
 autostash
 buildmeta
@@ -20,6 +21,7 @@ golangci
 gomod
 gomodscan
 govulncheck
+knownhosts
 ldflags
 lockfiles
 mktemp

@@ -1,10 +1,10 @@
 # nastools
 
-nastools deploys a Compose stack to Synology over SSH, with strict host identity checks and file-based configuration and secrets. It preserves persistent bind-mounted data and checks service readiness. Declared Tailscale Services expose healthy services. Rollback redeploys an earlier compatible commit.
+nastools deploys a Compose stack to Synology over SSH, with strict host identity checks and file-based configuration and secrets. It preserves persistent bind-mounted data and checks service readiness. Tailscale Service mappings and provenance labels belong to a later phase. Rollback redeploys an earlier compatible commit.
 
 ## Development
 
-The current binary exposes `version` and `check`. Deployment commands belong to later phases. [mise](https://mise.jdx.dev) pins the toolchain and runs the tasks. Run `mise run bootstrap` once, then `mise run check` before pushing. [AGENTS.md](AGENTS.md) is the contributor guide.
+The current binary exposes `version`, `check`, `deploy`, `status`, and `logs`. [mise](https://mise.jdx.dev) pins the toolchain and runs the tasks. Run `mise run bootstrap` once, then `mise run check` before pushing. [AGENTS.md](AGENTS.md) is the contributor guide.
 
 Build `bin/nastools` with `mise run build`, then run `bin/nastools version`. For a source run with the same metadata flags, use `mise run run version`. A plain `go run ./cmd/nastools version` uses the runtime build-info fallback for the version and leaves the commit and date empty.
 
@@ -24,6 +24,7 @@ required_env = ["REQUIRED_INPUT"]
 address_env = "SSH_ADDRESS"
 user_env = "SSH_USER"
 known_hosts_env = "SSH_KNOWN_HOSTS"
+lock_dir = "/example.invalid/locks"
 
 [files]
 STATIC_INPUT = "config/static.txt"
@@ -34,11 +35,38 @@ https = 443
 target = "http://example.invalid:3000"
 ```
 
-The default `wait_seconds` is 180.
+The default `wait_seconds` is 180. Project names use lowercase letters, digits, the `_` character, and hyphens. They start with a letter or digit.
+
+Set `[ssh].lock_dir` to an existing absolute directory on the network-attached storage device that the SSH user can write. It has no default.
 
 Every required variable and SSH input must have a non-empty value. Static files enter the Compose child environment unchanged. An optional `[expand_files]` table uses the same output-variable-to-path format and expands environment references in memory. Use it only for a backend without native credential-file or file-backed expansion support. Missing expansion inputs and unknown config fields fail the check. Each Serve entry selects either `https` or `tcp`, with a matching HTTP(S) or TCP target, and uses a unique (Service ID, port) pair.
 
-With a non-empty `GITHUB_ACTIONS` value, the check emits mask commands for required values, SSH inputs, and comma-separated `NASTOOLS_PRIVATE_STRINGS` before validation output. Git state supplies the commit label, with `-dirty` for modified or new files. Deployment and lock waiting belong to later phases.
+With a non-empty `GITHUB_ACTIONS` value, `check`, `deploy`, `status`, and `logs` emit mask commands for required values, SSH inputs, and comma-separated `NASTOOLS_PRIVATE_STRINGS` before validation output. Git state supplies the commit label, with `-dirty` for modified or new files. Provenance labels and Serve operations belong to a later phase.
+
+## Deploy and inspect
+
+Run `nastools deploy --config path/to/nastools.toml` to check inputs, get the project lock, pull images with `--ignore-buildable`, and bring up services with `--wait --wait-timeout <wait_seconds> --remove-orphans`. It then prints `compose ps`. Each step must succeed before the next starts. Compose output streams to standard output and standard error. `config -q` output stays discarded.
+
+Deployments aren't transactional.
+
+Inspection commands also accept `--config`:
+
+- `nastools status` prints `compose ps`.
+- `nastools logs [service] --tail N --follow` streams native Compose logs.
+- The default tail is 100 lines per service. Omit `--follow` to return after printing them.
+
+SSH setup:
+
+- Authentication uses the agent at `SSH_AUTH_SOCK`.
+- The configured address input must include a port, such as `nas.example.invalid:22`.
+- The configured known-hosts input contains `known_hosts` text, including more than one line. Host keys must match those entries.
+- nastools doesn't read SSH config or invoke an SSH binary or SSH File Transfer Protocol (SFTP) client.
+
+Each run creates a private temporary directory with mode 700 and a local Unix socket. Each socket connection opens an SSH session running `sudo -n /usr/local/bin/docker system dial-stdio`. Local Compose uses that socket through `DOCKER_HOST` and receives the checked input environment. nastools replaces inherited `DOCKER_HOST` and removes `DOCKER_CONTEXT`, `DOCKER_TLS`, `DOCKER_TLS_VERIFY`, and `DOCKER_CERT_PATH` for this connection. Normal completion, errors, SIGINT, and SIGTERM close the transport and remove its directory.
+
+The deployment lock is `<lock_dir>/<project>.lock`. An SSH session runs `flock -n <lockfile> cat` and holds the lock through status. If the lock is busy, nastools reports a deployment in progress and exits with an error. `nastools deploy --lock-wait 5m` retries for up to five minutes. The default is no wait. Closing the session releases the lock without persistent lock state or a break command. Different projects use different locks. `status` and `logs` don't get one.
+
+Before deployment use, network-attached storage qualification must verify host keys and agent authentication. It must also verify `sudo` without interaction, `flock` release on disconnect, and the pinned Compose/Engine combination.
 
 ## Releases
 
