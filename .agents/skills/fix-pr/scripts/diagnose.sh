@@ -99,19 +99,19 @@ reproducer() {
   *prose* | *vale*) printf 'mise run lint-prose\n' ;;
   *spell*) printf 'mise run devtools:lint-spelling\n' ;;
   *markdown* | *rumdl*) printf 'mise run devtools:lint-markdown\n' ;;
-  *shell*) printf 'mise run lint-shell && mise run lint-shell-fmt\n' ;;
+  *shell*) printf 'mise run devtools:lint-shell && mise run devtools:lint-shell-fmt\n' ;;
   *yaml*) printf 'mise run devtools:lint-yaml\n' ;;
   *toml*) printf 'mise run devtools:lint-toml\n' ;;
   *workflow* | *actionlint*) printf 'mise run devtools:lint-workflows\n' ;;
   *editorconfig*) printf 'mise run lint-editorconfig\n' ;;
-  *arch*) printf 'mise run lint-go-arch\n' ;;
-  *deadcode*) printf 'mise run lint-go-deadcode\n' ;;
+  *arch*) printf 'mise run devtools:lint-go-arch\n' ;;
+  *deadcode*) printf 'mise run devtools:lint-go-deadcode\n' ;;
   *lint*) printf 'mise run lint\n' ;;
-  *race*) printf 'mise run test-go-race\n' ;;
-  *cover*) printf 'mise run cover-go-check\n' ;;
+  *race*) printf 'mise run devtools:test-go-race\n' ;;
+  *cover*) printf 'mise run devtools:cover-go-check\n' ;;
   *test*) printf 'mise run test\n' ;;
-  *vendor*) printf 'mise run vendor-check\n' ;;
-  *vuln*) printf 'mise run vuln\n' ;;
+  *vendor*) printf 'mise run devtools:vendor-check\n' ;;
+  *vuln*) printf 'mise run devtools:vuln\n' ;;
   *gitleaks* | *secret*) printf 'mise run devtools:gitleaks\n' ;;
   *apm* | *validate*) printf 'apm install --frozen && apm audit --ci\n' ;;
   *fuzz*) printf 'mise run fuzz\n' ;;
@@ -125,6 +125,7 @@ while IFS="$(printf '\t')" read -r name link; do
   [ -n "$name" ] || continue
   printf '\n--------------------------------------------------------------\n'
   printf 'job:        %s\n' "$name"
+  # shellcheck disable=SC2312 # Only formats diagnostic output; no decision uses the status.
   printf 'reproduce:  %s\n' "$(reproducer "$name")"
   printf 'run:        %s\n' "$link"
 

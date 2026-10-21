@@ -19,14 +19,14 @@ unset CDPATH GH_REPO GH_HOST GREP_OPTIONS
 # mp_need_tools: gh, signed in, and jq, or stop.
 mp_need_tools() {
   command -v gh >/dev/null 2>&1 || dt_die "gh is not installed"
-  gh auth status >/dev/null 2>&1 || dt_die "gh is not authenticated; run gh auth login"
+  dt_gh_login >/dev/null || exit $?
   command -v jq >/dev/null 2>&1 || dt_die "jq is not installed"
 }
 
 # mp_view <number> <file> <field,...>: save one response naming every
 # field the caller reads.
 mp_view() {
-  gh pr view "$1" --json "$3" >"$2"
+  dt_gh pr view "$1" --json "$3" >"$2"
 }
 
 # mp_field <file> <field>: one top-level field of a saved response, a
@@ -38,7 +38,7 @@ mp_field() {
 # mp_base_oid <base-ref>: the commit the base branch points at on
 # GitHub, read through gh so it names the same repository gh merges in.
 mp_base_oid() {
-  gh api "repos/{owner}/{repo}/git/ref/heads/$1" --jq .object.sha
+  dt_gh_repo "query(\$owner:String!,\$name:String!,\$ref:String!){repository(owner:\$owner,name:\$name){ref(qualifiedName:\$ref){target{oid}}}}" -f "ref=refs/heads/$1" --jq '.data.repository.ref.target.oid // error("base ref not found")'
 }
 
 # mp_judge_checks <file>: judge the statusCheckRollup in a saved
@@ -103,3 +103,57 @@ mp_superseded() {
     | length - (group_by([(.workflowName // ""), .name]) | length)
   ' "$1"
 }
+
+# mp_require_reviews <file> <number>: distinguish waiting on GitHub's
+# required approvals from a broken merge. No approval is also valid
+# when the repository requires none.
+mp_require_reviews() {
+  local decision
+  decision=$(mp_field "$1" reviewDecision)
+  case ${decision:-NONE} in
+  APPROVED | NONE) ;;
+  REVIEW_REQUIRED | CHANGES_REQUESTED)
+    printf 'WAITING_REVIEW: #%s review decision is %s; GitHub still requires an approving review (for example, a code owner). Resolve the review requests, then rerun.\n' "$2" "$decision" >&2
+    exit 75
+    ;;
+  *) dt_die "#$2 has an unknown review decision: $decision" ;;
+  esac
+}
+
+# mp_local_diff <base-oid> <head-oid> <inputs-dir>: fetch the pinned
+# objects from the base repository, including fork PR heads exposed by
+# its pull refs. Use gh authentication for private repositories without
+# persisting credentials. Do not change branches, the index, or FETCH_HEAD.
+mp_local_diff() {
+  local repository
+  repository=$(dt_gh repo view --json url --jq .url) || exit $?
+  [ -n "$repository" ] || dt_die "Could not locate the pull request repository."
+  local shallow
+  shallow=$(gitr rev-parse --is-shallow-repository) || return $?
+  if [ "$shallow" = true ]; then
+    gitr -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --no-tags --no-write-fetch-head --unshallow "$repository" "$1" "$2" ||
+      dt_die "Could not fetch the complete pinned base and head histories."
+  else
+    gitr -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --no-tags --no-write-fetch-head "$repository" "$1" "$2" ||
+      dt_die "Could not fetch the pinned base and head."
+  fi
+  gitr diff --no-ext-diff --no-textconv --no-color --binary --full-index "$1...$2" -- >"$3/change.diff" ||
+    dt_die "Could not build the complete pinned diff."
+  gitr diff --no-ext-diff --no-textconv --no-color --name-status "$1...$2" -- >"$3/files.txt" ||
+    dt_die "Could not list the pinned diff files."
+}
+
+# mp_fetch_commit <oid>: make one pinned pull request commit available
+# without moving a branch, the index, or FETCH_HEAD.
+mp_fetch_commit() {
+  gitr cat-file -e "$1^{commit}" 2>/dev/null && return 0
+  local repository
+  repository=$(dt_gh repo view --json url --jq .url) || return $?
+  [ -n "$repository" ] || dt_die "Could not locate the pull request repository."
+  gitr -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+    fetch --no-tags --no-write-fetch-head "$repository" "$1" ||
+    dt_die "Could not fetch the pinned pull request head."
+}
+
+# shellcheck disable=SC1091 # generated beside this reader
+. "$DT_LIB_DIR/merge-agent.sh"

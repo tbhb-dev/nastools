@@ -6,15 +6,17 @@ description = "Build every binary into the bin directory"
 run = '''
 #!/usr/bin/env bash
 set -eu
-CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags "$(bash "$DEVTOOLS_DIR/scripts/go-ldflags.sh")" -o bin/ ${DEVTOOLS_GO_BIN_PACKAGES:-./cmd/...} "$@"
+ldflags=$(bash "$DEVTOOLS_DIR/scripts/go-ldflags.sh")
+CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags "$ldflags" -o bin/ ${DEVTOOLS_GO_BIN_PACKAGES:-./cmd/...} "$@"
 '''
 
 ["devtools:install"]
-description = "Install every binary to GOPATH/bin"
+description = "Install every binary to the mise-managed Go installation's bin directory"
 run = '''
 #!/usr/bin/env bash
 set -eu
-CGO_ENABLED=0 go install -trimpath -buildvcs=false -ldflags "$(bash "$DEVTOOLS_DIR/scripts/go-ldflags.sh")" ${DEVTOOLS_GO_BIN_PACKAGES:-./cmd/...} "$@"
+ldflags=$(bash "$DEVTOOLS_DIR/scripts/go-ldflags.sh")
+CGO_ENABLED=0 go install -trimpath -buildvcs=false -ldflags "$ldflags" ${DEVTOOLS_GO_BIN_PACKAGES:-./cmd/...} "$@"
 '''
 
 ["devtools:format-go"]
@@ -60,7 +62,7 @@ golangci-lint run --modules-download-mode=${DEVTOOLS_GO_MODULES_MODE:-readonly} 
 
 ["devtools:lint-go-arch"]
 description = "Enforce intra-project layering rules from .go-arch-lint.yml"
-run = "go-arch-lint check"
+run = 'uv run --script "$DEVTOOLS_DIR/scripts/lint-go-arch.py"'
 
 ["devtools:lint-go-all"]
 description = "Aggregate every Go-flavored lint gate"
@@ -127,12 +129,17 @@ go test -race ${DEVTOOLS_GO_PACKAGES:-./...} "$@"
 '''
 
 ["devtools:mutate-go"]
-description = "Run mutation testing via gremlins"
-usage = 'arg "<path>" default="."'
+description = "Run mutation testing via gremlins: [path] -- [Gremlins arguments]"
+usage = '''
+arg "[path]" default="."
+arg "[args]" var=#true double_dash="required" help="Gremlins arguments after -- (for example --dry-run)"
+'''
 run = '''
 #!/usr/bin/env bash
 set -eu
-go tool gremlins unleash --timeout-coefficient "${GREMLINS_TIMEOUT_COEFFICIENT:-100}" $usage_path "$@"
+# mise supplies variadic arguments as a shell-quoted string.
+eval "args=(${usage_args:-})"
+go tool gremlins unleash --timeout-coefficient "${GREMLINS_TIMEOUT_COEFFICIENT:-100}" "$usage_path" ${args[@]+"${args[@]}"}
 '''
 
 ["devtools:mutate-go-all"]
@@ -212,7 +219,8 @@ run = '''
 set -euo pipefail
 rm -rf coverage.covdata.merged
 mkdir -p coverage.covdata.merged
-go tool covdata merge -i="$(ls -d "$usage_slotsdir"/*/ | paste -sd, -)" -o=coverage.covdata.merged
+inputs=$(ls -d "$usage_slotsdir"/*/ | paste -sd, -)
+go tool covdata merge -i="$inputs" -o=coverage.covdata.merged
 go tool covdata textfmt -i=coverage.covdata.merged -o=coverage.out
 go tool gocover-cobertura < coverage.out > coverage.xml
 '''
@@ -238,20 +246,16 @@ set -eu
 go tool govulncheck -format sarif ${DEVTOOLS_GO_PACKAGES:-./...} > "$usage_file" "$@"
 '''
 
+# Modules without a tracked vendor manifest intentionally skip the text scan
+# and vendor check. SARIF requires vendor mode so a successful run has a report.
 ["devtools:gomodscan"]
-description = "Scan each vendored module for supply-chain concerns in one pass"
-run = "go tool gomodscan"
+description = "Scan tracked vendored modules, or skip a non-vendoring module"
+run = 'bash "$DEVTOOLS_DIR/scripts/gomodscan.sh" text'
 
 ["devtools:gomodscan-sarif"]
-description = "Emit the gomodscan findings as SARIF to <file> for the security.yml upload"
+description = "Write validated SARIF; findings succeed, incomplete scans fail"
 usage = 'arg "<file>"'
-run = '''
-#!/usr/bin/env bash
-set -uo pipefail
-go tool gomodscan -format sarif > "$usage_file"
-rc=$?
-if [ "$rc" -gt 1 ]; then exit "$rc"; fi
-'''
+run = 'bash "$DEVTOOLS_DIR/scripts/gomodscan.sh" sarif "$usage_file"'
 
 ["devtools:tidy"]
 description = "Tidy go.mod"
@@ -270,9 +274,21 @@ description = "Check that vendor/, go.mod, and go.sum are in sync"
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
+tracked=$(git ls-files -- vendor/modules.txt)
+if [ -z "$tracked" ]; then
+  echo "vendor-check: skipping module without tracked vendor/modules.txt"
+  exit 0
+fi
 go mod tidy
 go mod vendor
-if ! git diff --exit-code -- go.mod go.sum vendor/; then
+rc=0
+git diff --exit-code -- go.mod go.sum vendor/ || rc=1
+untracked=$(git ls-files --others --exclude-per-directory=.gitignore -- go.mod go.sum vendor/)
+if [ -n "$untracked" ]; then
+    printf '%s\n' "$untracked"
+    rc=1
+fi
+if [ "$rc" -ne 0 ]; then
     echo "vendor drift detected — run 'mise run devtools:vendor' and commit" >&2
     exit 1
 fi

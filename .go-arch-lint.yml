@@ -30,7 +30,6 @@ exclude:
   - vendor
   - testdata
   - tools
-  # Local workaround for tbhb-dev/devtools#180: skip deployed dependencies.
   - apm_modules
   - .claude
   - .codex
