@@ -82,6 +82,32 @@ func TestRemoteCommandPolicy(t *testing.T) {
 	}
 }
 
+// TestDeployLockPath checks that deploy takes the lock in the directory that
+// Prepare resolved, from either key.
+func TestDeployLockPath(t *testing.T) {
+	t.Parallel()
+	literal, _, _ := strings.Cut(configText, "[files]")
+	variable := strings.Replace(literal, `lock_dir = "/example.invalid/locks"`, `lock_dir_env = "SSH_LOCK_DIR"`, 1)
+	for _, tc := range []struct {
+		name string
+		text string
+		want string
+	}{
+		{"literal", literal, "/example.invalid/locks/example.lock"},
+		{"variable", variable, "/lock.example.invalid/example.lock"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := &nastoolstest.Fake{Files: map[string]string{"nastools.toml": tc.text}}
+			env := environment()
+			env["SSH_LOCK_DIR"] = "/lock.example.invalid"
+			require.NoError(t, nastools.Execute(t.Context(), f, "nastools.toml", env, &f.Out, &f.Out,
+				nastools.Command{Name: nastools.Deploy}))
+			assert.Equal(t, []string{tc.want}, f.LockPaths)
+		})
+	}
+}
+
 func TestRemoteFailureCleanup(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

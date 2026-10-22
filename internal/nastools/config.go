@@ -40,7 +40,23 @@ type SSH struct {
 	AddressEnv    string `toml:"address_env"`
 	UserEnv       string `toml:"user_env"`
 	KnownHostsEnv string `toml:"known_hosts_env"`
-	LockDir       string `toml:"lock_dir"`
+	// The lock directory keys are pointers so that a key set to "" still
+	// counts as present.
+	LockDir    *string `toml:"lock_dir"`
+	LockDirEnv *string `toml:"lock_dir_env"`
+}
+
+// lockDir returns the lock directory from whichever key the config sets. It
+// returns "" when both keys are present, so validation rejects both as it
+// rejects neither.
+func (s SSH) lockDir(env map[string]string) string {
+	switch {
+	case s.LockDirEnv == nil && s.LockDir != nil:
+		return *s.LockDir
+	case s.LockDir == nil && s.LockDirEnv != nil:
+		return env[*s.LockDirEnv]
+	}
+	return ""
 }
 
 type Endpoint struct {
@@ -66,7 +82,7 @@ func (c Config) validate() error {
 	if !regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`).MatchString(c.Project) {
 		return fmt.Errorf("project: %w", ErrInvalid)
 	}
-	if !filepath.IsAbs(c.SSH.LockDir) {
+	if !filepath.IsAbs(*c.SSH.LockDir) {
 		return fmt.Errorf("ssh.lock_dir: %w", ErrInvalid)
 	}
 	if len(c.Compose) == 0 {
@@ -173,6 +189,8 @@ func (c Config) inputNames() []string {
 }
 
 func Prepare(ctx context.Context, ops Operations, path string, c Config, env map[string]string) (Inputs, error) {
+	lockDir := c.SSH.lockDir(env)
+	c.SSH.LockDir = &lockDir
 	if err := c.validate(); err != nil {
 		return Inputs{}, err
 	}
@@ -303,7 +321,7 @@ func Execute(ctx context.Context, ops Operations, path string, env map[string]st
 		return fmt.Errorf("SSH transport: %w", ErrInvalid)
 	}
 	if command.Name == Deploy {
-		lock := filepath.Join(config.SSH.LockDir, config.Project+".lock")
+		lock := filepath.Join(*inputs.Config.SSH.LockDir, inputs.Config.Project+".lock")
 		if err = acquire(ctx, ops, lock, command.LockWait); err != nil {
 			return err
 		}

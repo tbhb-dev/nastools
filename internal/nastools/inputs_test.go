@@ -24,7 +24,7 @@ func config() nastools.Config {
 			AddressEnv:    "SSH_ADDRESS",
 			UserEnv:       "SSH_USER",
 			KnownHostsEnv: "SSH_KNOWN_HOSTS",
-			LockDir:       "/example.invalid/locks",
+			LockDir:       new("/example.invalid/locks"),
 		},
 	}
 }
