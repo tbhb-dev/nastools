@@ -41,6 +41,20 @@ type SSH struct {
 	UserEnv       string `toml:"user_env"`
 	KnownHostsEnv string `toml:"known_hosts_env"`
 	LockDir       string `toml:"lock_dir"`
+	LockDirEnv    string `toml:"lock_dir_env"`
+}
+
+// lockDir returns the lock directory from whichever key the config sets. It
+// returns "" when both keys are set, so validation rejects both as it
+// rejects neither.
+func (s SSH) lockDir(env map[string]string) string {
+	switch {
+	case s.LockDirEnv == "":
+		return s.LockDir
+	case s.LockDir == "":
+		return env[s.LockDirEnv]
+	}
+	return ""
 }
 
 type Endpoint struct {
@@ -173,6 +187,7 @@ func (c Config) inputNames() []string {
 }
 
 func Prepare(ctx context.Context, ops Operations, path string, c Config, env map[string]string) (Inputs, error) {
+	c.SSH.LockDir = c.SSH.lockDir(env)
 	if err := c.validate(); err != nil {
 		return Inputs{}, err
 	}
@@ -303,7 +318,7 @@ func Execute(ctx context.Context, ops Operations, path string, env map[string]st
 		return fmt.Errorf("SSH transport: %w", ErrInvalid)
 	}
 	if command.Name == Deploy {
-		lock := filepath.Join(config.SSH.LockDir, config.Project+".lock")
+		lock := filepath.Join(inputs.Config.SSH.LockDir, inputs.Config.Project+".lock")
 		if err = acquire(ctx, ops, lock, command.LockWait); err != nil {
 			return err
 		}

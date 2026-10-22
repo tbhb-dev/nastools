@@ -22,6 +22,7 @@ import (
 const (
 	maskPrefix   = "::add-mask::"
 	tailnetName  = "node.example.ts.net"
+	lockDir      = "/secret-8.example.invalid/locks"
 	matrixConfig = `project = "example"
 compose = ["compose.yaml"]
 required_env = ["REQUIRED_INPUT"]
@@ -29,7 +30,7 @@ required_env = ["REQUIRED_INPUT"]
 address_env = "SSH_ADDRESS"
 user_env = "SSH_USER"
 known_hosts_env = "SSH_KNOWN_HOSTS"
-lock_dir = "/example.invalid/locks"
+lock_dir_env = "SSH_LOCK_DIR"
 [files]
 STATIC_INPUT = "static.txt"
 [expand_files]
@@ -47,7 +48,7 @@ func canaries() []string {
 	return []string{
 		"secret-1.example.invalid", "secret-2.example.invalid", "secret-3.example.invalid",
 		"secret-4.example.invalid", "secret-5.example.invalid", "secret-6.example.invalid",
-		"secret-7.example.invalid", tailnetName,
+		"secret-7.example.invalid", lockDir, tailnetName,
 	}
 }
 
@@ -60,7 +61,9 @@ func matrixEnv() map[string]string {
 		"SSH_USER":                 "secret-3.example.invalid",
 		"SSH_KNOWN_HOSTS": "secret-4.example.invalid ssh-ed25519 " +
 			"AAAAC3NzaC1lZDI1NTE5AAAAICZ4niA2YR6ErsZQRahQYkioleR/p9/qUOStEMhVy/K5\n",
-		"TEMPLATE_INPUT": "secret-5.example.invalid",
+		"SSH_LOCK_DIR":      lockDir,
+		"RELATIVE_LOCK_DIR": "secret-9.example.invalid/locks",
+		"TEMPLATE_INPUT":    "secret-5.example.invalid",
 	}
 }
 
@@ -108,8 +111,16 @@ func fixtures() []fixture {
 		{"unknown field first", config(func(text string) string { return "unknown = 'x'\n" + text }), nil, true},
 		{"upper-case keys", config(strings.NewReplacer(
 			"required_env", "REQUIRED_ENV", "[ssh]", "[SSH]", "address_env", "ADDRESS_ENV",
-			"[files]", "[FILES]", "[expand_files]", "[EXPAND_FILES]",
+			"lock_dir_env", "LOCK_DIR_ENV", "[files]", "[FILES]", "[expand_files]", "[EXPAND_FILES]",
 		).Replace), nil, false},
+		{"literal lock_dir", func(f *nastoolstest.Fake) {
+			replace(`lock_dir_env = "SSH_LOCK_DIR"`, `lock_dir = "/example.invalid/locks"`)(f)
+			f.Canaries = slices.DeleteFunc(f.Canaries, func(value string) bool { return value == lockDir })
+		}, []string{lockDir}, false},
+		{"lock_dir_env malformed", replace(`lock_dir_env =`, `lock_dir_env = =`), nil, true},
+		{"lock_dir_env missing", replace(`"SSH_LOCK_DIR"`, `"ABSENT_LOCK_DIR"`), []string{lockDir}, false},
+		{"lock_dir_env relative", replace(`"SSH_LOCK_DIR"`, `"RELATIVE_LOCK_DIR"`), []string{lockDir}, false},
+		{"both lock keys", replace("[ssh]", "[ssh]\nlock_dir = \"/example.invalid/locks\""), nil, false},
 		{"invalid serve", replace("https = 443", "https = 0"), nil, false},
 		{"duplicate output", replace("EXPANDED_INPUT =", "STATIC_INPUT ="), nil, false},
 		{"missing env", replace(`["REQUIRED_INPUT"]`, `["REQUIRED_INPUT", "ABSENT_INPUT"]`), nil, false},
@@ -141,7 +152,8 @@ func fixtures() []fixture {
 // key points at the variable of another, with every input in that list
 // forward and reversed. A value then arrives both as a plain value and as
 // an address or known-hosts value, and each order must still yield every
-// host name.
+// host name. It also lists the lock directory variable as required, in
+// either order.
 func inputFixtures() []fixture {
 	declare := func(name string, required []string, ssh ...string) fixture {
 		return fixture{name, func(f *nastoolstest.Fake) {
@@ -163,7 +175,7 @@ func inputFixtures() []fixture {
 		}},
 	}
 	orders := permutations(inputs)
-	result := make([]fixture, 0, len(orders)+2*len(overlaps))
+	result := make([]fixture, 0, len(orders)+2*len(overlaps)+2)
 	for _, order := range orders {
 		result = append(result, declare("required_env "+strings.Join(order, " "), order))
 	}
@@ -174,6 +186,9 @@ func inputFixtures() []fixture {
 			result = append(result, declare(overlap.name+", required_env "+strings.Join(order, " "), order,
 				overlap.ssh...))
 		}
+	}
+	for _, order := range [][]string{{"REQUIRED_INPUT", "SSH_LOCK_DIR"}, {"SSH_LOCK_DIR", "REQUIRED_INPUT"}} {
+		result = append(result, declare("lock directory required, required_env "+strings.Join(order, " "), order))
 	}
 	return result
 }
@@ -246,8 +261,8 @@ func matrixCases() []matrixCase {
 		"short help":     {"-h"},
 		"missing config": {"--config=missing.toml"},
 	}
-	// The fixture's discovery writes nine masks.
-	writers := map[string]int{"healthy": 0, "first write fails": 1, "write after masks fails": 10}
+	// The fixture's discovery writes ten masks.
+	writers := map[string]int{"healthy": 0, "first write fails": 1, "write after masks fails": 11}
 	all := fixtures()
 	cases := make([]matrixCase, 0, len(all)*len(commands)*len(shapes)*len(writers))
 	for _, fx := range all {
@@ -328,7 +343,7 @@ func expectedMasks(unmasked []string) map[string]bool {
 	for _, value := range []string{
 		"secret-1.example.invalid", "secret-2.example.invalid:22", "secret-2.example.invalid",
 		"secret-3.example.invalid", "secret-4.example.invalid", "secret-5.example.invalid",
-		"secret-6.example.invalid", "secret-7.example.invalid",
+		"secret-6.example.invalid", "secret-7.example.invalid", lockDir,
 	} {
 		masks[value] = true
 	}
@@ -377,8 +392,8 @@ func TestRunRedactsCanaries(t *testing.T) {
 		matrixEnv())
 	assert.Equal(t, exitOK, code)
 	assert.Contains(t, out.String(), maskPrefix+tailnetName+"\n")
-	assert.Contains(t, out.String(), "output *** *** *** *** *** *** *** ***\n")
-	assert.Contains(t, errOut.String(), "output *** *** *** *** *** *** *** ***\n")
+	assert.Contains(t, out.String(), "output *** *** *** *** *** *** *** *** ***\n")
+	assert.Contains(t, errOut.String(), "output *** *** *** *** *** *** *** *** ***\n")
 	assert.Contains(t, out.String(), `"***:443"`)
 }
 
@@ -451,7 +466,7 @@ func TestLateMaskFailureFailsRun(t *testing.T) {
 	f := matrixFake()
 	f.Canaries = nil
 	f.Files["nastools.toml"] = strings.Split(matrixConfig, "[[serve]]")[0]
-	out, errOut := &faultyWriter{failAt: 10}, &faultyWriter{}
+	out, errOut := &faultyWriter{failAt: 11}, &faultyWriter{}
 	code := Run(t.Context(), []string{"deploy"}, streams{in: strings.NewReader(""), out: out, err: errOut},
 		stderrOnly{f}, matrixEnv())
 	assert.True(t, out.maskFailed)

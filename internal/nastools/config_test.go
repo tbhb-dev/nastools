@@ -59,6 +59,39 @@ func TestConfigPolicy(t *testing.T) {
 	}
 }
 
+func TestLockDirPolicy(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		dir    string
+		dirEnv string
+		value  string
+		want   string
+	}{
+		{"literal", "/example.invalid/locks", "", "/lock.example.invalid", "/example.invalid/locks"},
+		{"variable", "", "SSH_LOCK_DIR", "/lock.example.invalid", "/lock.example.invalid"},
+		{"both", "/example.invalid/locks", "SSH_LOCK_DIR", "/lock.example.invalid", ""},
+		{"neither", "", "", "/lock.example.invalid", ""},
+		{"variable empty", "", "SSH_LOCK_DIR", "", ""},
+		{"variable relative", "", "SSH_LOCK_DIR", "lock.example.invalid", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := config()
+			c.SSH.LockDir, c.SSH.LockDirEnv = tc.dir, tc.dirEnv
+			env := environment()
+			env["SSH_LOCK_DIR"] = tc.value
+			got, err := nastools.Prepare(t.Context(), &nastoolstest.Fake{}, "nastools.toml", c, env)
+			if tc.want == "" {
+				require.EqualError(t, err, "ssh.lock_dir: invalid or missing input")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got.Config.SSH.LockDir)
+		})
+	}
+}
+
 func TestServePolicy(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

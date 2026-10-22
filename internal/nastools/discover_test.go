@@ -28,6 +28,7 @@ func discoverEnv() map[string]string {
 		"SSH_ADDRESS":     "secret-2.example.invalid:22",
 		"SSH_USER":        "secret-3.example.invalid",
 		"SSH_KNOWN_HOSTS": knownHostsText,
+		"SSH_LOCK_DIR":    "/secret-10.example.invalid/locks",
 		"TEMPLATE_A":      "secret-5.example.invalid",
 		"TEMPLATE_B":      "secret-6.example.invalid",
 		"UNUSED_INPUT":    "secret-9.example.invalid",
@@ -63,10 +64,31 @@ func TestDiscoverSuperset(t *testing.T) {
 		"dotted": discoverBase + "ssh.address_env = \"SSH_ADDRESS\"\nssh.user_env = \"SSH_USER\"\n" +
 			"ssh.known_hosts_env = \"SSH_KNOWN_HOSTS\"\nssh.lock_dir = \"/example.invalid/locks\"\n" +
 			"expand_files.B_OUTPUT = \"b.txt\"\n",
+		"lock directory variable": discoverBase + "required_env = [\"REQUIRED_INPUT\"]\n" +
+			strings.Replace(ssh, "lock_dir = \"/example.invalid/locks\"", "lock_dir_env = \"SSH_LOCK_DIR\"", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			assertSuperset(t, config)
+		})
+	}
+}
+
+// TestDiscoverLockDirEnv checks that discovery finds the lock directory
+// value with the key in any case, with or without a syntax error.
+func TestDiscoverLockDirEnv(t *testing.T) {
+	t.Parallel()
+	for name, config := range map[string]string{
+		"lower case":                   "[ssh]\nlock_dir_env = \"SSH_LOCK_DIR\"\n",
+		"upper case":                   "[SSH]\nLOCK_DIR_ENV = \"SSH_LOCK_DIR\"\n",
+		"lower case with syntax error": "project = = 'example'\n[ssh]\nlock_dir_env = \"SSH_LOCK_DIR\"\n",
+		"upper case with syntax error": "project = = 'example'\n[SSH]\nLOCK_DIR_ENV = \"SSH_LOCK_DIR\"\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got := discover(discoverFiles(discoverBase+config), discoverEnv())
+			assert.Contains(t, got, "/secret-10.example.invalid/locks")
+			assert.NotContains(t, got, "secret-9.example.invalid")
 		})
 	}
 }

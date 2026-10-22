@@ -24,7 +24,7 @@ required_env = ["REQUIRED_INPUT"]
 address_env = "SSH_ADDRESS"
 user_env = "SSH_USER"
 known_hosts_env = "SSH_KNOWN_HOSTS"
-lock_dir = "/example.invalid/locks"
+lock_dir_env = "SSH_LOCK_DIR"
 
 [files]
 STATIC_INPUT = "config/static.txt"
@@ -37,7 +37,7 @@ target = "http://example.invalid:3000"
 
 The default `wait_seconds` is 180. Project names use lowercase letters, digits, the `_` character, and hyphens. They start with a letter or digit.
 
-Set `[ssh].lock_dir` to an existing absolute directory on the network-attached storage device that the SSH user can write. It has no default.
+The lock directory is an existing absolute directory on the network-attached storage device that the SSH user can write. The example sets `[ssh].lock_dir_env` to the name of an environment variable whose value is that path. A config can instead set `[ssh].lock_dir` to the path itself. A config sets exactly one of the two, and neither has a default. The value of `lock_dir_env` is an SSH input, and like a `lock_dir` path it must be absolute.
 
 Every required variable and SSH input must have a non-empty value. Static files enter the Compose child environment unchanged. An optional `[expand_files]` table uses the same output-variable-to-path format and expands environment references in memory. Use it only for a backend without native credential-file or file-backed expansion support. Missing expansion inputs and unknown config fields fail the check. The config and each file it names must be a regular file of at most 1 MiB. nastools checks the type before it opens one, so a named pipe, a device, or a larger file fails as unreadable instead of blocking the run. Each Serve entry selects either `https` or `tcp`, with a matching HTTP(S) or TCP target, and uses a unique (Service ID, port) pair. A Service ID has the form `svc:` plus a DNS label of lowercase letters, digits, and hyphens, with no leading or trailing hyphen and at most 63 characters. Ports, including the port in a target, range from 1 to 65535.
 
@@ -95,7 +95,7 @@ SSH setup:
 
 Each run creates a private temporary directory with mode 700 and a local Unix socket. Each socket connection opens an SSH session running `sudo -n /usr/local/bin/docker system dial-stdio`. Local Compose uses that socket through `DOCKER_HOST` and receives the checked input environment. nastools replaces inherited `DOCKER_HOST` and removes `DOCKER_CONTEXT`, `DOCKER_TLS`, `DOCKER_TLS_VERIFY`, and `DOCKER_CERT_PATH` for this connection. Normal completion, errors, SIGINT, and SIGTERM close the transport and remove its directory.
 
-The deployment lock is `<lock_dir>/<project>.lock`. An SSH session runs `flock -n <lockfile> cat` and holds the lock through status. If the lock is busy, nastools reports a deployment in progress and exits with an error. `nastools deploy --lock-wait 5m` retries for up to five minutes and reports the same error if the lock is still busy then. If the lock session ends for any reason before the run finishes, nastools cancels the run. The default is no wait. Closing the session releases the lock without persistent lock state or a break command. Different projects use different locks. `status` and `logs` don't get one.
+The deployment lock is `<lock directory>/<project>.lock`. An SSH session runs `flock -n <lockfile> cat` and holds the lock through status. If the lock is busy, nastools reports a deployment in progress and exits with an error. `nastools deploy --lock-wait 5m` retries for up to five minutes and reports the same error if the lock is still busy then. If the lock session ends for any reason before the run finishes, nastools cancels the run. The default is no wait. Closing the session releases the lock without persistent lock state or a break command. Different projects use different locks. `status` and `logs` don't get one.
 
 Before deployment use, network-attached storage qualification must verify host keys and agent authentication. It must also verify `sudo` without interaction, `flock` release on disconnect, and the pinned Compose/Engine combination.
 
