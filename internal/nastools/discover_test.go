@@ -137,8 +137,8 @@ func FuzzDiscoverAnyCase(f *testing.F) {
 				k(
 					"known_hosts_env",
 				) + " = \"SSH_KNOWN_HOSTS\", " + k(
-				"lock_dir",
-			) + " = \"/example.invalid/locks\" }\n"
+				"lock_dir_env",
+			) + " = \"SSH_LOCK_DIR\" }\n"
 		}
 		assertSuperset(t, config)
 	})

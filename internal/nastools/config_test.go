@@ -94,6 +94,31 @@ func TestLockDirPolicy(t *testing.T) {
 	}
 }
 
+// TestLockDirDecodedEmpty checks, through the strict decoder, that a lock
+// directory key set to "" still counts as present beside the other key.
+func TestLockDirDecodedEmpty(t *testing.T) {
+	t.Parallel()
+	literal, _, _ := strings.Cut(configText, "[files]")
+	for _, tc := range []struct {
+		name string
+		keys string
+	}{
+		{"literal empty", "lock_dir = \"\"\nlock_dir_env = \"SSH_LOCK_DIR\""},
+		{"variable name empty", "lock_dir = \"/example.invalid/locks\"\nlock_dir_env = \"\""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			text := strings.Replace(literal, `lock_dir = "/example.invalid/locks"`, tc.keys, 1)
+			f := &nastoolstest.Fake{Files: map[string]string{"nastools.toml": text}}
+			env := environment()
+			env["SSH_LOCK_DIR"] = "/lock.example.invalid"
+			err := nastools.Execute(t.Context(), f, "nastools.toml", env, nil, nil,
+				nastools.Command{Name: nastools.CheckName})
+			require.EqualError(t, err, "ssh.lock_dir: invalid or missing input")
+		})
+	}
+}
+
 func TestServePolicy(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
