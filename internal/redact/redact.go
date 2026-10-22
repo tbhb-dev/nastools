@@ -188,15 +188,17 @@ func trimBlankLines(value string) string {
 	return strings.TrimRight(value, "\r")
 }
 
-// derivedForms lists the lines of a multi-line value. For an address or
-// known-hosts value, it adds the host part of an address and the host fields
-// of a known-hosts line.
+// derivedForms lists the lines of a multi-line value, or a single-line value
+// without its surrounding whitespace. For an address or known-hosts value, it
+// adds the host part of an address and the host fields of a known-hosts line.
 func derivedForms(value string, hosts bool) []string {
 	var forms []string
 	if strings.Contains(value, "\n") {
 		for line := range strings.Lines(value) {
 			forms = append(forms, strings.TrimSpace(line))
 		}
+	} else if trimmed := strings.TrimSpace(value); trimmed != value {
+		forms = append(forms, trimmed)
 	}
 	if !hosts {
 		return forms

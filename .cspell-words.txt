@@ -54,3 +54,4 @@ stretchr
 nastoolstest
 tailnet
 Pwritev
+netdns

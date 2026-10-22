@@ -55,6 +55,7 @@ func matrixEnv() map[string]string {
 	return map[string]string{
 		"GITHUB_ACTIONS":           "true",
 		"NASTOOLS_PRIVATE_STRINGS": "secret-6.example.invalid",
+		"PADDED_INPUT":             "\tsecret-1.example.invalid",
 		"REQUIRED_INPUT":           "secret-1.example.invalid",
 		"SSH_ADDRESS":              "secret-2.example.invalid:22",
 		"SSH_USER":                 "secret-3.example.invalid",
@@ -113,6 +114,8 @@ func fixtures() []fixture {
 		{"invalid serve", replace("https = 443", "https = 0"), nil, false},
 		{"duplicate output", replace("EXPANDED_INPUT =", "STATIC_INPUT ="), nil, false},
 		{"missing env", replace(`["REQUIRED_INPUT"]`, `["REQUIRED_INPUT", "ABSENT_INPUT"]`), nil, false},
+		// The fake prints the value without its tab.
+		{"tab-prefixed required input", replace(`["REQUIRED_INPUT"]`, `["PADDED_INPUT"]`), nil, false},
 		{"template read", func(f *nastoolstest.Fake) { delete(f.Files, "expanded.txt") }, []string{
 			"secret-5.example.invalid",
 		}, false},

@@ -18,13 +18,56 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestNoDirectOutput backs up the lint rule. No source outside main.go may
-// use a name that writes to a process stream past the gate.
+// wiringPath is the file whose main function hands the process streams to Run.
+const wiringPath = "../../cmd/nastools/main.go"
+
+// TestNoDirectOutput backs up the lint rule. No source outside the main
+// function in main.go may use a name that writes to a process stream past
+// the gate.
 func TestNoDirectOutput(t *testing.T) {
 	t.Parallel()
 	for _, path := range sources(t) {
-		assert.Empty(t, directOutput(t, parse(t, path, nil)), path)
+		assert.Empty(t, directOutput(t, outsideWiring(path, parse(t, path, nil))), path)
 	}
+}
+
+// TestDirectOutputOutsideWiring checks that the exemption covers only the
+// main function in main.go, not an adapter beside it or another file.
+func TestDirectOutputOutsideWiring(t *testing.T) {
+	t.Parallel()
+	source := `package main
+
+import (
+	"os"
+	process "os/exec"
+)
+
+func main() {
+	run(os.Stdout, os.Stderr)
+}
+
+func (*operations) Compose() error {
+	cmd := process.Command("docker", "compose")
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+`
+	assert.Equal(t, []string{"os.Stderr"}, directOutput(t, outsideWiring(wiringPath, parse(t, wiringPath, source))))
+	other := "../../cmd/nastools/run.go"
+	assert.Equal(t, []string{"os.Stdout", "os.Stderr", "os.Stderr"},
+		directOutput(t, outsideWiring(other, parse(t, other, source))))
+}
+
+// outsideWiring drops the main function from main.go, so every other
+// declaration there stays checked.
+func outsideWiring(path string, file *ast.File) *ast.File {
+	if filepath.ToSlash(path) == wiringPath {
+		file.Decls = slices.DeleteFunc(file.Decls, func(decl ast.Decl) bool {
+			fn, ok := decl.(*ast.FuncDecl)
+			return ok && fn.Recv == nil && fn.Name.Name == "main"
+		})
+	}
+	return file
 }
 
 func TestDirectOutputFindsEachForm(t *testing.T) {
@@ -140,8 +183,8 @@ func directOutput(t *testing.T, file *ast.File) []string {
 }
 
 // TestNoStreamDevicePaths backs up the lint rule, which can't see call
-// arguments. No source outside main.go may contain a device path, such as a
-// `/dev/stderr` argument to os.OpenFile, or the pieces of one.
+// arguments. No source may contain a device path, such as a `/dev/stderr`
+// argument to os.OpenFile, or the pieces of one.
 func TestNoStreamDevicePaths(t *testing.T) {
 	t.Parallel()
 	for _, path := range sources(t) {
@@ -154,7 +197,7 @@ func TestNoStreamDevicePaths(t *testing.T) {
 	}
 }
 
-// sources lists every Go source outside tests, vendor, and main.go.
+// sources lists every Go source outside tests and vendor.
 func sources(t *testing.T) []string {
 	t.Helper()
 	root := filepath.Join("..", "..")
@@ -167,8 +210,7 @@ func sources(t *testing.T) []string {
 		switch {
 		case entry.IsDir() && path != root && (name == "vendor" || strings.HasPrefix(name, ".")):
 			return filepath.SkipDir
-		case strings.HasSuffix(name, ".go") && !strings.HasSuffix(name, "_test.go") &&
-			filepath.ToSlash(path) != "../../cmd/nastools/main.go":
+		case strings.HasSuffix(name, ".go") && !strings.HasSuffix(name, "_test.go"):
 			paths = append(paths, path)
 		}
 		return nil
