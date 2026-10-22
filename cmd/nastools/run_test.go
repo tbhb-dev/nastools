@@ -6,14 +6,16 @@ package main
 import (
 	"bytes"
 	"errors"
-	"slices"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/tbhb-dev/nastools/internal/buildmeta"
-	"github.com/tbhb-dev/nastools/internal/nastools"
+	"github.com/tbhb-dev/nastools/internal/nastools/nastoolstest"
 )
 
 type harness struct {
@@ -25,7 +27,13 @@ type harness struct {
 func exec(t *testing.T, args ...string) harness {
 	t.Helper()
 	var out, errOut bytes.Buffer
-	code := Run(t.Context(), args, streams{in: strings.NewReader(""), out: &out, err: &errOut}, nil, nil)
+	code := Run(
+		t.Context(),
+		args,
+		streams{in: strings.NewReader(""), out: &out, err: &errOut},
+		&nastoolstest.Fake{},
+		nil,
+	)
 	return harness{code: code, stdout: out.String(), stderr: errOut.String()}
 }
 
@@ -78,150 +86,102 @@ func TestVersionWriteFailure(t *testing.T) {
 		t.Context(),
 		[]string{"version"},
 		streams{in: strings.NewReader(""), out: failingWriter{}, err: &errOut},
-		nil,
+		&nastoolstest.Fake{},
 		nil,
 	)
 	assert.Equal(t, exitError, code)
 	assert.Contains(t, errOut.String(), "write version")
 }
 
-type unreadableConfigOperations struct {
-	nastools.Operations
-
-	path string
-	data []byte
-}
-
-var errPrivateConfig = errors.New("private.example.invalid")
-
-func (f *unreadableConfigOperations) ReadFile(path string) ([]byte, error) {
-	f.path = path
-	if f.data != nil {
-		return f.data, nil
-	}
-	return nil, errPrivateConfig
-}
-
 func TestCheckUnreadableConfig(t *testing.T) {
 	t.Parallel()
 
 	var out, errOut bytes.Buffer
-	f := &unreadableConfigOperations{}
+	f := &nastoolstest.Fake{}
 	path := "private.example.invalid/config.toml"
 	code := Run(t.Context(), []string{"check", "--config", path},
 		streams{in: strings.NewReader(""), out: &out, err: &errOut}, f,
 		map[string]string{"NASTOOLS_PRIVATE_STRINGS": "private.example.invalid"})
-	assert.Equal(t, 2, code)
-	assert.Equal(t, path, f.path)
+	assert.Equal(t, exitError, code)
+	assert.Equal(t, []string{"read:" + path}, f.Calls)
 	assert.Empty(t, out.String())
 	assert.Contains(t, errOut.String(), "nastools.toml: unreadable input")
 	assert.NotContains(t, errOut.String(), "private.example.invalid")
 }
 
-func TestRemoteCommandsMaskErrors(t *testing.T) {
+// TestBrokenConfigHidesArguments checks that under Actions, when the config
+// doesn't parse, no error echoes the arguments, whatever discovery found.
+func TestBrokenConfigHidesArguments(t *testing.T) {
 	t.Parallel()
+	const argument = "argument.example.invalid"
 	for _, args := range [][]string{
-		{"deploy"},
-		{"status"},
-		{"logs", "example", "--tail", "20", "--follow"},
-		{"deploy", "--lock-wait", "2s"},
-		{"deploy", "--lock-wait", "private.example.invalid"},
-		{"logs", "--unknown=private.example.invalid"},
-		{"status", "private.example.invalid"},
-		{"deploy", "--config"},
-		{"deploy", "--unknown", "--", "--config", "ignored"},
+		{"version", argument},
+		{argument},
+		{"help", argument},
+		{"version", "--" + argument},
+		{"deploy", "--lock-wait", argument},
 	} {
-		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			t.Parallel()
-			var out bytes.Buffer
-			f := &unreadableConfigOperations{}
-			code := Run(t.Context(), args, streams{out: &out, err: &out}, f, map[string]string{
-				"GITHUB_ACTIONS": "true", "NASTOOLS_PRIVATE_STRINGS": "private.example.invalid",
-			})
-			assert.Equal(t, exitError, code)
-			assert.Equal(
-				t,
-				"::add-mask::private.example.invalid\nnastools: nastools.toml: unreadable input: invalid or missing input\n",
-				out.String(),
-			)
-		})
-	}
-}
-
-func TestRemoteFlagAndArgumentErrors(t *testing.T) {
-	t.Parallel()
-	for _, args := range [][]string{
-		{"deploy"},
-		{"status"},
-		{"logs", "example", "--tail", "20", "--follow"},
-		{"deploy", "--lock-wait", "2s"},
-		{"deploy", "--lock-wait", "private.example.invalid"},
-		{"logs", "--unknown=private.example.invalid"},
-		{"status", "private.example.invalid"},
-		{"deploy", "--config"},
-		{"deploy", "--unknown", "--", "--config", "ignored"},
-		{"logs", "--help"},
-	} {
-		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			t.Parallel()
-			var out bytes.Buffer
-			f := &unreadableConfigOperations{data: []byte(`project = ""`)}
-			code := Run(t.Context(), args, streams{out: &out, err: &out}, f, map[string]string{
-				"GITHUB_ACTIONS": "true", "NASTOOLS_PRIVATE_STRINGS": "private.example.invalid",
-			})
-			if slices.Contains(args, "--help") {
-				assert.Equal(t, exitOK, code)
-			} else {
-				assert.Equal(t, exitError, code)
-			}
-			assert.True(t, strings.HasPrefix(out.String(), "::add-mask::private.example.invalid\n"))
-			assert.NotContains(
-				t,
-				strings.TrimPrefix(out.String(), "::add-mask::private.example.invalid\n"),
-				"private.example.invalid",
-			)
-		})
-	}
-}
-
-func TestRemoteConfigAfterFlagError(t *testing.T) {
-	t.Parallel()
-	for _, prefix := range [][]string{
-		{"deploy", "--unknown=required.example.invalid"},
-		{"deploy", "--lock-wait", "required.example.invalid"},
-		{"logs", "--help"},
-	} {
-		for _, configFlag := range [][]string{
-			{"--config", "example.invalid/custom.toml"},
-			{"--config=example.invalid/custom.toml"},
-		} {
-			args := append(slices.Clone(prefix), configFlag...)
-			t.Run(strings.Join(args, " "), func(t *testing.T) {
+		for _, broken := range []bool{false, true} {
+			t.Run(fmt.Sprint(args, broken), func(t *testing.T) {
 				t.Parallel()
-				var out bytes.Buffer
-				f := &unreadableConfigOperations{data: []byte(`required_env = ["REQUIRED"]
-[ssh]
-address_env = "ADDRESS"
-user_env = "USER"
-known_hosts_env = "KNOWN_HOSTS"
-`)}
-				code := Run(t.Context(), args, streams{out: &out, err: &out}, f, map[string]string{
-					"GITHUB_ACTIONS": "true", "REQUIRED": "required.example.invalid",
-					"ADDRESS": "nas.example.invalid:22", "USER": "user.example.invalid",
-					"KNOWN_HOSTS": "key.example.invalid",
-				})
-				assert.Equal(t, "example.invalid/custom.toml", f.path)
-				masks := "::add-mask::key.example.invalid\n::add-mask::nas.example.invalid:22\n" +
-					"::add-mask::required.example.invalid\n::add-mask::user.example.invalid\n"
-				assert.True(t, strings.HasPrefix(out.String(), masks))
-				if slices.Contains(prefix, "--help") {
-					assert.Equal(t, exitOK, code)
-					assert.Contains(t, out.String(), "Usage:")
+				config := "project = 'example'\n"
+				if broken {
+					config = "project = = 'example'\n"
+				}
+				var out, errOut bytes.Buffer
+				code := Run(t.Context(), args, streams{in: strings.NewReader(""), out: &out, err: &errOut},
+					&nastoolstest.Fake{Files: map[string]string{"nastools.toml": config}},
+					map[string]string{"GITHUB_ACTIONS": "true"})
+				assert.Equal(t, exitError, code)
+				assert.Empty(t, out.String())
+				if broken || args[0] == "deploy" {
+					assert.Equal(t, "nastools: invalid or missing input\n", errOut.String())
 				} else {
-					assert.Equal(t, exitError, code)
-					assert.Equal(t, masks+"nastools: invalid or missing input\n", out.String())
+					assert.Contains(t, errOut.String(), argument)
 				}
 			})
 		}
+	}
+}
+
+// TestConfigArgument checks the config path against the flag parser of the
+// command tree, for every argument list that parses.
+func TestConfigArgument(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{nil, "nastools.toml"},
+		{[]string{"deploy"}, "nastools.toml"},
+		{[]string{"deploy", "--config", "a.toml"}, "a.toml"},
+		{[]string{"deploy", "--config=a.toml"}, "a.toml"},
+		{[]string{"deploy", "--config="}, ""},
+		{[]string{"deploy", "--config", "a.toml", "--config=b.toml"}, "b.toml"},
+		{[]string{"deploy", "--config", "--", "--config", "b.toml"}, "b.toml"},
+		{[]string{"deploy", "--config", "--config=b.toml"}, "--config=b.toml"},
+		{[]string{"deploy", "--config", "-h"}, "-h"},
+		{[]string{"deploy", "--", "--config", "b.toml"}, "nastools.toml"},
+		{[]string{"deploy", "--config=a.toml", "--", "--config=b.toml"}, "a.toml"},
+		{[]string{"--config", "a.toml", "deploy"}, "a.toml"},
+		{[]string{"logs", "web", "--follow", "--config", "a.toml"}, "a.toml"},
+		{[]string{"deploy", "--lock-wait", "1s", "--config", "a.toml"}, "a.toml"},
+		// The flag parser stops at these errors, and nothing reads a config.
+		{[]string{"deploy", "--config"}, "nastools.toml"},
+		{[]string{"deploy", "--unknown", "--config", "a.toml"}, "a.toml"},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, configArgument(tc.args))
+			root := newRootCmd(t.Context(), streams{in: strings.NewReader(""), out: io.Discard, err: io.Discard},
+				&nastoolstest.Fake{}, nil)
+			target, flags, err := root.Find(tc.args)
+			if err != nil || target == root || target.ParseFlags(flags) != nil {
+				return
+			}
+			got, err := target.Flags().GetString("config")
+			require.NoError(t, err)
+			assert.Equal(t, got, configArgument(tc.args))
+		})
 	}
 }

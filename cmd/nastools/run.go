@@ -15,6 +15,7 @@ import (
 
 	"github.com/tbhb-dev/nastools/internal/buildmeta"
 	"github.com/tbhb-dev/nastools/internal/nastools"
+	"github.com/tbhb-dev/nastools/internal/redact"
 )
 
 // Exit statuses.
@@ -31,27 +32,47 @@ type streams struct {
 	err io.Writer
 }
 
-// Run executes the command and returns the process exit status.
+// Run executes the command and returns the process exit status. Every byte
+// of output passes the gate, which knows the discovered values before any.
 func Run(ctx context.Context, args []string, s streams, ops nastools.Operations, env map[string]string) int {
+	actions := env["GITHUB_ACTIONS"] != ""
+	gate := redact.New(s.out, s.err, actions, redact.TailnetName)
+	ops = nastools.Cached(ops)
+	path := configArgument(args)
+	private := nastools.Discover(ops.ReadFile, path, env)
+	gate.Register(redact.Set{Values: private.Values, Hosts: private.Hosts})
+	code := exitError
+	if gate.Err() != nil {
+		fmt.Fprintln(gate.Stderr(), "nastools: mask output:", nastools.ErrInvalid)
+	} else {
+		// Discovery can miss a value that a config that doesn't parse
+		// declares, so no error may then echo the arguments.
+		hideArgs := actions && !nastools.Parses(ops.ReadFile, path)
+		code = run(ctx, args, streams{in: s.in, out: gate.Stdout(), err: gate.Stderr()}, ops, env, hideArgs)
+	}
+	if gate.Close() != nil {
+		return exitError
+	}
+	return code
+}
+
+func run(ctx context.Context, args []string, s streams, ops nastools.Operations, env map[string]string,
+	hideArgs bool,
+) int {
+	// Cobra's hidden completion commands write diagnostics straight to the
+	// process's standard error, past the gate.
+	if slices.ContainsFunc(args, func(arg string) bool {
+		return arg == cobra.ShellCompRequestCmd || arg == cobra.ShellCompNoDescRequestCmd
+	}) {
+		fmt.Fprintln(s.err, "nastools:", nastools.ErrInvalid)
+		return exitError
+	}
 	cmd := newRootCmd(ctx, s, ops, env)
 	cmd.SetArgs(args)
-
-	target, flags, findErr := cmd.Find(args)
-	remote := findErr == nil &&
-		slices.Contains([]string{nastools.CheckName, nastools.Deploy, "status", nastools.Logs}, target.Name())
-	if remote {
-		// Find the config even when flag parsing stops before reaching it.
-		target.InitDefaultHelpFlag()
-		parseErr := target.ParseFlags(flags)
-		if parseErr != nil || target.ValidateArgs(target.Flags().Args()) != nil || target.Flags().Changed("help") {
-			if _, err := nastools.Load(ops, configArgument(flags), env, s.out); err != nil {
-				fmt.Fprintln(s.err, "nastools:", err)
-				return exitError
-			}
-		}
-	}
-	if err := cmd.ExecuteContext(ctx); err != nil {
-		if remote && !errors.Is(err, nastools.ErrInvalid) {
+	target, err := cmd.ExecuteContextC(ctx)
+	if err != nil {
+		remote := slices.Contains([]string{nastools.CheckName, nastools.Deploy, "status", nastools.Logs}, target.Name())
+		if (remote || hideArgs) && !errors.Is(err, nastools.ErrInvalid) {
 			err = nastools.ErrInvalid
 		}
 		fmt.Fprintln(s.err, "nastools:", err)
@@ -60,15 +81,16 @@ func Run(ctx context.Context, args []string, s streams, ops nastools.Operations,
 	return exitOK
 }
 
-func configArgument(flags []string) string {
+// configArgument reads the config path the way the flag parser does. The
+// token after the config flag is always its value, and a bare double dash
+// ends the flags.
+func configArgument(args []string) string {
 	configPath := "nastools.toml"
-	for i, flag := range flags {
-		if flag == "--" {
-			break
-		}
-		if flag == "--config" && i+1 < len(flags) {
-			configPath = flags[i+1]
-		} else if value, ok := strings.CutPrefix(flag, "--config="); ok {
+	for i := 0; i < len(args) && args[i] != "--"; i++ {
+		if args[i] == "--config" && i+1 < len(args) {
+			i++
+			configPath = args[i]
+		} else if value, ok := strings.CutPrefix(args[i], "--config="); ok {
 			configPath = value
 		}
 	}
@@ -89,6 +111,7 @@ func newRootCmd(ctx context.Context, s streams, ops nastools.Operations, env map
 	root.SetIn(s.in)
 	root.SetOut(s.out)
 	root.SetErr(s.err)
+	root.SetHelpCommand(newHelpCmd())
 	root.AddCommand(newVersionCmd())
 	for _, name := range []string{nastools.CheckName, nastools.Deploy, "status", nastools.Logs} {
 		const defaultTail = 100
@@ -118,6 +141,25 @@ func newRootCmd(ctx context.Context, s streams, ops nastools.Operations, env map
 	}
 
 	return root
+}
+
+// newHelpCmd replaces Cobra's help command, which prints an unknown topic
+// back and writes its own errors straight to the process's standard error.
+func newHelpCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "help [command]",
+		Short: "Help about any command",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			target, _, err := cmd.Root().Find(args)
+			if err != nil {
+				return fmt.Errorf("help: %w", err)
+			}
+			target.InitDefaultHelpFlag()
+			target.InitDefaultVersionFlag()
+			target.HelpFunc()(target, nil)
+			return nil
+		},
+	}
 }
 
 func newVersionCmd() *cobra.Command {

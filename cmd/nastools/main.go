@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"net"
 	"os"
 	"os/signal"
@@ -74,9 +75,29 @@ type pooledClient struct {
 	busy   int
 }
 
-func (*operations) ReadFile(path string) ([]byte, error) {
-	data, err := os.ReadFile(filepath.Clean(path))
+func (o *operations) ReadFile(path string) ([]byte, error) {
+	data, err := nastools.ReadInput(o, path)
 	return data, sanitized(err)
+}
+
+func (*operations) Stat(path string) (fs.FileInfo, error) {
+	info, err := os.Stat(filepath.Clean(path))
+	return info, sanitized(err)
+}
+
+// OpenFile doesn't block, so a named pipe that replaces the file after Stat
+// can't hang the read, and it refuses anything but a regular file.
+func (*operations) OpenFile(path string) (io.ReadCloser, error) {
+	file, err := os.OpenFile(filepath.Clean(path), os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, sanitized(err)
+	}
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		_ = file.Close()
+		return nil, nastools.ErrInvalid
+	}
+	return file, nil
 }
 
 func (*operations) GitState(ctx context.Context, dir string) (nastools.GitState, error) {

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"net/url"
 	"os"
@@ -129,8 +130,15 @@ func resolve(dir, path string) string {
 	return filepath.Join(dir, path)
 }
 
+// Files opens deployment inputs. ReadInput reads through it.
+type Files interface {
+	Stat(path string) (fs.FileInfo, error)
+	OpenFile(path string) (io.ReadCloser, error)
+}
+
 // Operations supplies effects used by the policy.
 type Operations interface {
+	Files
 	ReadFile(path string) ([]byte, error)
 	GitState(ctx context.Context, dir string) (GitState, error)
 	Compose(ctx context.Context, args, env []string, out, errOut io.Writer) error
@@ -162,32 +170,6 @@ type Inputs struct {
 
 func (c Config) inputNames() []string {
 	return append(slices.Clone(c.RequiredEnv), c.SSH.AddressEnv, c.SSH.UserEnv, c.SSH.KnownHostsEnv)
-}
-
-// PrivateValues is deterministic and never changes the supplied environment.
-func PrivateValues(c Config, env map[string]string) []string {
-	values := make(map[string]bool)
-	for _, name := range c.inputNames() {
-		values[env[name]] = true
-	}
-	for value := range strings.SplitSeq(env["NASTOOLS_PRIVATE_STRINGS"], ",") {
-		values[strings.TrimSpace(value)] = true
-	}
-	delete(values, "")
-	return slices.Sorted(maps.Keys(values))
-}
-
-// MaskCommands escapes workflow-command data, including embedded newlines.
-func MaskCommands(values []string, githubActions bool) string {
-	if !githubActions {
-		return ""
-	}
-	var out strings.Builder
-	escape := strings.NewReplacer("%", "%25", "\r", "%0D", "\n", "%0A")
-	for _, value := range values {
-		fmt.Fprintf(&out, "::add-mask::%s\n", escape.Replace(value))
-	}
-	return out.String()
 }
 
 func Prepare(ctx context.Context, ops Operations, path string, c Config, env map[string]string) (Inputs, error) {
@@ -256,20 +238,12 @@ func childEnvironment(env map[string]string) []string {
 	return result
 }
 
-func Load(ops Operations, path string, env map[string]string, out io.Writer) (Config, error) {
-	data, readErr := ops.ReadFile(path)
-	c, err := parse(data)
-	// Mask even on read or parse failure, retaining any partially decoded input names.
-	if _, writeErr := io.WriteString(
-		out,
-		MaskCommands(PrivateValues(c, env), env["GITHUB_ACTIONS"] != ""),
-	); writeErr != nil {
-		return c, fmt.Errorf("mask output: %w", ErrInvalid)
+func load(ops Operations, path string) (Config, error) {
+	data, err := ops.ReadFile(path)
+	if err != nil {
+		return Config{}, fmt.Errorf("nastools.toml: unreadable input: %w", ErrInvalid)
 	}
-	if readErr != nil {
-		return c, fmt.Errorf("nastools.toml: unreadable input: %w", ErrInvalid)
-	}
-	return c, err
+	return parse(data)
 }
 
 func compose(ctx context.Context, ops Operations, inputs Inputs, command []string, out, errOut io.Writer) error {
@@ -305,7 +279,7 @@ type Command struct {
 func Execute(ctx context.Context, ops Operations, path string, env map[string]string,
 	out, errOut io.Writer, command Command,
 ) error {
-	config, err := Load(ops, path, env, out)
+	config, err := load(ops, path)
 	if err != nil {
 		return err
 	}
