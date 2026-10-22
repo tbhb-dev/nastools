@@ -41,7 +41,18 @@ Set `[ssh].lock_dir` to an existing absolute directory on the network-attached s
 
 Every required variable and SSH input must have a non-empty value. Static files enter the Compose child environment unchanged. An optional `[expand_files]` table uses the same output-variable-to-path format and expands environment references in memory. Use it only for a backend without native credential-file or file-backed expansion support. Missing expansion inputs and unknown config fields fail the check. Each Serve entry selects either `https` or `tcp`, with a matching HTTP(S) or TCP target, and uses a unique (Service ID, port) pair.
 
-With a non-empty `GITHUB_ACTIONS` value, `check`, `deploy`, `status`, and `logs` emit mask commands for required values, SSH inputs, and comma-separated `NASTOOLS_PRIVATE_STRINGS` before validation output. Git state supplies the commit label, with `-dirty` for modified or new files.
+With a non-empty `GITHUB_ACTIONS` value, every command first reads the config without validating it and emits a mask command for each private value it finds, before any other output. A malformed config still yields its values. nastools treats as private the value of each required variable and SSH input, the host names in those values, the variables that `[expand_files]` templates reference, each `[files]` line of at least eight characters, and each entry in the comma-separated `NASTOOLS_PRIVATE_STRINGS`. nastools then writes standard output and standard error line by line, including Compose and Serve output, and replaces each private value and each `*.ts.net` host name with `***`. A host name seen for the first time gets its own mask command before its line. A failed mask write stops the command before it starts, or fails it with a nonzero exit later. Line buffering can change how lines from the two streams interleave. Without `GITHUB_ACTIONS`, output passes through unchanged.
+
+Redaction doesn't cover:
+
+- Values nastools never sees, such as the `.env` file that Compose reads on its own, other environment variables Compose interpolates, and secrets that exist only inside containers.
+- Transformed forms of a value, such as JSON-escaped, URL-encoded, base64, shell-quoted, partial, or hashed text.
+- A Go runtime panic, which writes past the redacting writers.
+- The step's `env:` block, which the runner prints before nastools starts. Pass private values through `secrets.*`, not `vars.*`.
+- Short values: lines under eight characters within a multi-line value or a `[files]` file, and host names that short. nastools replaces a short value of its own wherever it appears.
+- Application output in `logs`, beyond the known values.
+
+Git state supplies the commit label, with `-dirty` for modified or new files.
 
 ## Deploy and inspect
 

@@ -173,6 +173,15 @@ linters:
         - switch
         - map
 
+    # Process output passes the redact gate. Only cmd/nastools/main.go holds
+    # the process streams; see the exclusion rule below.
+    forbidigo:
+      forbid:
+        - pattern: ^os\.(Stdout|Stderr)$
+          msg: write through the gate's writers instead
+        - pattern: ^(fmt\.Print(f|ln)?|log\.(Print|Fatal|Panic)(f|ln)?|print|println)$
+          msg: write through the gate's writers instead
+
     funlen:
       lines: 100
       statements: 50
@@ -323,3 +332,6 @@ linters:
         linters:
           - funlen
           - goconst
+      # main.go hands the process streams to Run, which gates them.
+      - path: ^cmd/nastools/main\.go$
+        linters: [forbidigo]

@@ -51,3 +51,5 @@ gochecknoglobals
 gochecknoinits
 nolint
 stretchr
+nastoolstest
+tailnet

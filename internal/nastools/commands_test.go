@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/tbhb-dev/nastools/internal/nastools"
+	"github.com/tbhb-dev/nastools/internal/nastools/nastoolstest"
 )
 
 func TestRemoteCommandPolicy(t *testing.T) {
@@ -45,21 +46,18 @@ func TestRemoteCommandPolicy(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			f := &fakeOperations{files: map[string]string{"nastools.toml": strings.Split(configText, "[files]")[0]}}
+			f := &nastoolstest.Fake{Files: map[string]string{"nastools.toml": strings.Split(configText, "[files]")[0]}}
 			env := environment()
-			env["GITHUB_ACTIONS"] = "true"
 			env["DOCKER_HOST"] = "tcp://example.invalid:2375"
 			for _, name := range []string{"DOCKER_CONTEXT", "DOCKER_TLS", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"} {
 				env[name] = "example.invalid"
 			}
-			require.NoError(t, nastools.Execute(t.Context(), f, "nastools.toml", env, &f.out, &f.out, tc.command))
+			require.NoError(t, nastools.Execute(t.Context(), f, "nastools.toml", env, &f.Out, &f.Out, tc.command))
 			assertCommands(t, f, base, tc.want, env)
-			assert.Contains(t, f.out.String(), "::add-mask::"+strings.ReplaceAll(knownHostsText, "\n", "%0A"))
-			assert.Len(t, f.commands, len(tc.want))
-			assert.Equal(t, 1, f.closed)
-			assert.Equal(t, knownHostsText, f.knownHosts)
-			masks := nastools.MaskCommands(nastools.PrivateValues(config(), env), true)
-			assert.True(t, strings.HasPrefix(f.out.String(), masks+"compose output\ncompose diagnostic\n"))
+			assert.Len(t, f.Commands, len(tc.want))
+			assert.Equal(t, 1, f.Closed)
+			assert.Equal(t, knownHostsText, f.KnownHosts)
+			assert.True(t, strings.HasPrefix(f.Out.String(), "compose output\ncompose diagnostic\n"))
 			if tc.name == "deploy" {
 				assert.Equal(
 					t,
@@ -74,11 +72,11 @@ func TestRemoteCommandPolicy(t *testing.T) {
 						"compose",
 						"close",
 					},
-					f.calls,
+					f.Calls,
 				)
-				assert.Equal(t, []string{"/example.invalid/locks/example.lock"}, f.lockPaths)
+				assert.Equal(t, []string{"/example.invalid/locks/example.lock"}, f.LockPaths)
 			} else {
-				assert.Empty(t, f.lockPaths)
+				assert.Empty(t, f.LockPaths)
 			}
 		})
 	}
@@ -88,42 +86,31 @@ func TestRemoteFailureCleanup(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name    string
-		change  func(*fakeOperations)
+		change  func(*nastoolstest.Fake)
 		command nastools.Command
 		want    []string
 		closed  int
 	}{
-		{"input", func(f *fakeOperations) { f.files = nil }, nastools.Command{Name: "deploy"}, []string{"read:nastools.toml"}, 0},
-		{"config", func(f *fakeOperations) { f.failCommand = "config" }, nastools.Command{Name: "deploy"}, []string{"read:nastools.toml", "git", "compose"}, 0},
-		{"open", func(f *fakeOperations) { f.openErr = errPrivate }, nastools.Command{Name: "deploy"}, []string{"read:nastools.toml", "git", "compose", "open", "close"}, 1},
-		{"lock", func(f *fakeOperations) { f.lockErrors = []error{errPrivate} }, nastools.Command{Name: "deploy"}, []string{"read:nastools.toml", "git", "compose", "open", "lock", "close"}, 1},
-		{"pull", func(f *fakeOperations) { f.failCommand = "pull" }, nastools.Command{Name: "deploy"}, []string{"read:nastools.toml", "git", "compose", "open", "lock", "compose", "close"}, 1},
-		{"up", func(f *fakeOperations) { f.failCommand = "up" }, nastools.Command{Name: "deploy"}, []string{"read:nastools.toml", "git", "compose", "open", "lock", "compose", "compose", "close"}, 1},
-		{"ps", func(f *fakeOperations) { f.failCommand = "ps" }, nastools.Command{Name: "status"}, []string{"read:nastools.toml", "git", "open", "compose", "close"}, 1},
-		{"logs interrupted", func(f *fakeOperations) { f.composeErr = context.Canceled }, nastools.Command{Name: "logs", Follow: true}, []string{"read:nastools.toml", "git", "open", "compose", "close"}, 1},
-		{"negative wait", func(*fakeOperations) {}, nastools.Command{Name: "deploy", LockWait: -time.Second}, []string{"read:nastools.toml", "git"}, 0},
-		{"negative tail", func(*fakeOperations) {}, nastools.Command{Name: "logs", Tail: -1}, []string{"read:nastools.toml", "git"}, 0},
+		{"input", func(f *nastoolstest.Fake) { f.Files = nil }, nastools.Command{Name: "deploy"}, []string{"read:nastools.toml"}, 0},
+		{"config", func(f *nastoolstest.Fake) { f.FailCommand = "config" }, nastools.Command{Name: "deploy"}, []string{"read:nastools.toml", "git", "compose"}, 0},
+		{"open", func(f *nastoolstest.Fake) { f.OpenErr = nastoolstest.ErrPrivate }, nastools.Command{Name: "deploy"}, []string{"read:nastools.toml", "git", "compose", "open", "close"}, 1},
+		{"lock", func(f *nastoolstest.Fake) { f.LockErrors = []error{nastoolstest.ErrPrivate} }, nastools.Command{Name: "deploy"}, []string{"read:nastools.toml", "git", "compose", "open", "lock", "close"}, 1},
+		{"pull", func(f *nastoolstest.Fake) { f.FailCommand = "pull" }, nastools.Command{Name: "deploy"}, []string{"read:nastools.toml", "git", "compose", "open", "lock", "compose", "close"}, 1},
+		{"up", func(f *nastoolstest.Fake) { f.FailCommand = "up" }, nastools.Command{Name: "deploy"}, []string{"read:nastools.toml", "git", "compose", "open", "lock", "compose", "compose", "close"}, 1},
+		{"ps", func(f *nastoolstest.Fake) { f.FailCommand = "ps" }, nastools.Command{Name: "status"}, []string{"read:nastools.toml", "git", "open", "compose", "close"}, 1},
+		{"logs interrupted", func(f *nastoolstest.Fake) { f.ComposeErr = context.Canceled }, nastools.Command{Name: "logs", Follow: true}, []string{"read:nastools.toml", "git", "open", "compose", "close"}, 1},
+		{"negative wait", func(*nastoolstest.Fake) {}, nastools.Command{Name: "deploy", LockWait: -time.Second}, []string{"read:nastools.toml", "git"}, 0},
+		{"negative tail", func(*nastoolstest.Fake) {}, nastools.Command{Name: "logs", Tail: -1}, []string{"read:nastools.toml", "git"}, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			f := &fakeOperations{files: map[string]string{"nastools.toml": strings.Split(configText, "[files]")[0]}}
+			f := &nastoolstest.Fake{Files: map[string]string{"nastools.toml": strings.Split(configText, "[files]")[0]}}
 			tc.change(f)
-			env := environment()
-			env["GITHUB_ACTIONS"] = "true"
-			env["NASTOOLS_PRIVATE_STRINGS"] = "extra.example.invalid"
-			err := nastools.Execute(t.Context(), f, "nastools.toml", env, &f.out, &f.out, tc.command)
+			err := nastools.Execute(t.Context(), f, "nastools.toml", environment(), &f.Out, &f.Out, tc.command)
 			require.ErrorIs(t, err, nastools.ErrInvalid)
-			assert.NotContains(t, err.Error(), errPrivate.Error())
-			assert.Equal(t, tc.want, f.calls)
-			assert.Equal(t, tc.closed, f.closed)
-			c := config()
-			if tc.name == "input" {
-				c = nastools.Config{}
-			}
-			assert.True(
-				t,
-				strings.HasPrefix(f.out.String(), nastools.MaskCommands(nastools.PrivateValues(c, env), true)),
-			)
+			assert.NotContains(t, err.Error(), nastoolstest.ErrPrivate.Error())
+			assert.Equal(t, tc.want, f.Calls)
+			assert.Equal(t, tc.closed, f.Closed)
 		})
 	}
 }
@@ -142,80 +129,57 @@ func TestLockWaitPolicy(t *testing.T) {
 		{"retry", time.Minute, []error{nastools.ErrBusy, nastools.ErrBusy, nil}, nil, 3, false},
 		{"deadline", time.Minute, []error{nastools.ErrBusy}, context.DeadlineExceeded, 1, true},
 		{"cancel", time.Minute, []error{nastools.ErrBusy}, context.Canceled, 1, true},
-		{"failure is not busy", time.Minute, []error{errPrivate}, nil, 1, false},
+		{"failure is not busy", time.Minute, []error{nastoolstest.ErrPrivate}, nil, 1, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			f := &fakeOperations{
-				files:      map[string]string{"nastools.toml": strings.Split(configText, "[files]")[0]},
-				lockErrors: tc.errors,
-				pauseErr:   tc.pauseErr,
+			f := &nastoolstest.Fake{
+				Files:      map[string]string{"nastools.toml": strings.Split(configText, "[files]")[0]},
+				LockErrors: tc.errors,
+				PauseErr:   tc.pauseErr,
 			}
 			err := nastools.Execute(
 				t.Context(),
 				f,
 				"nastools.toml",
 				environment(),
-				&f.out,
-				&f.out,
+				&f.Out,
+				&f.Out,
 				nastools.Command{Name: "deploy", LockWait: tc.wait},
 			)
 			if tc.name == "retry" {
 				require.NoError(t, err)
-				assert.Len(t, f.commands, 4)
+				assert.Len(t, f.Commands, 4)
 			} else {
 				require.ErrorIs(t, err, nastools.ErrInvalid)
-				assert.Len(t, f.commands, 1)
+				assert.Len(t, f.Commands, 1)
 			}
 			if tc.wantBusy {
 				require.ErrorIs(t, err, nastools.ErrBusy)
 			}
-			assert.Len(t, f.lockPaths, tc.attempts)
-			assert.Equal(t, 1, f.closed)
+			assert.Len(t, f.LockPaths, tc.attempts)
+			assert.Equal(t, 1, f.Closed)
 		})
 	}
 }
 
-func TestRemoteMaskFailure(t *testing.T) {
-	t.Parallel()
-	for _, name := range []string{"deploy", "status", "logs"} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			f := &fakeOperations{files: map[string]string{"nastools.toml": configText}}
-			env := environment()
-			env["GITHUB_ACTIONS"] = "true"
-			err := nastools.Execute(
-				t.Context(),
-				f,
-				"nastools.toml",
-				env,
-				failingWriter{},
-				&f.out,
-				nastools.Command{Name: name},
-			)
-			require.ErrorContains(t, err, "mask output")
-			assert.Equal(t, []string{"read:nastools.toml"}, f.calls)
-		})
-	}
-}
-
-func assertCommands(t *testing.T, f *fakeOperations, base []string, want [][]string, env map[string]string) {
+func assertCommands(t *testing.T, f *nastoolstest.Fake, base []string, want [][]string, env map[string]string) {
 	t.Helper()
 	for i, command := range want {
-		assert.Equal(t, append(slices.Clone(base), command...), f.commands[i])
-		for _, private := range nastools.PrivateValues(config(), env) {
-			assert.NotContains(t, strings.Join(f.commands[i], " "), private)
+		assert.Equal(t, append(slices.Clone(base), command...), f.Commands[i])
+		for _, private := range environment() {
+			assert.NotContains(t, strings.Join(f.Commands[i], " "), private)
 		}
 		if command[0] == "config" {
-			assert.Contains(t, f.environments[i], "DOCKER_HOST="+env["DOCKER_HOST"])
+			assert.Contains(t, f.Environments[i], "DOCKER_HOST="+env["DOCKER_HOST"])
 			for _, name := range []string{"DOCKER_CONTEXT", "DOCKER_TLS", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"} {
-				assert.Contains(t, f.environments[i], name+"="+env[name])
+				assert.Contains(t, f.Environments[i], name+"="+env[name])
 			}
 			continue
 		}
-		assert.Contains(t, f.environments[i], "DOCKER_HOST=unix:///example.invalid/socket")
-		assert.Contains(t, f.environments[i], "REQUIRED_INPUT=required.example.invalid")
-		for _, entry := range f.environments[i] {
+		assert.Contains(t, f.Environments[i], "DOCKER_HOST=unix:///example.invalid/socket")
+		assert.Contains(t, f.Environments[i], "REQUIRED_INPUT=required.example.invalid")
+		for _, entry := range f.Environments[i] {
 			name, _, _ := strings.Cut(entry, "=")
 			assert.NotContains(
 				t,

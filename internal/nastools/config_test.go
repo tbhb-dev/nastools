@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/tbhb-dev/nastools/internal/nastools"
+	"github.com/tbhb-dev/nastools/internal/nastools/nastoolstest"
 )
 
 func TestConfigPolicy(t *testing.T) {
@@ -47,12 +48,12 @@ func TestConfigPolicy(t *testing.T) {
 			t.Parallel()
 			c := config()
 			tc.change(&c)
-			f := &fakeOperations{}
+			f := &nastoolstest.Fake{}
 			_, err := nastools.Prepare(t.Context(), f, "nastools.toml", c, environment())
 			require.ErrorIs(t, err, nastools.ErrInvalid)
 			assert.Contains(t, err.Error(), tc.field)
 			assert.NotContains(t, err.Error(), "private.example.invalid")
-			assert.Empty(t, f.calls)
+			assert.Empty(t, f.Calls)
 		})
 	}
 }
@@ -84,7 +85,7 @@ func TestServePolicy(t *testing.T) {
 			t.Parallel()
 			c := config()
 			c.Serve = []nastools.Endpoint{tc.endpoint}
-			_, err := nastools.Prepare(t.Context(), &fakeOperations{}, "nastools.toml", c, environment())
+			_, err := nastools.Prepare(t.Context(), &nastoolstest.Fake{}, "nastools.toml", c, environment())
 			if tc.valid {
 				require.NoError(t, err)
 			} else {
@@ -101,6 +102,6 @@ func TestServiceOnDistinctPorts(t *testing.T) {
 		{Service: "svc:otlp", TCP: 4317, Target: "tcp://example.invalid:4317"},
 		{Service: "svc:otlp", TCP: 4318, Target: "tcp://example.invalid:4318"},
 	}
-	_, err := nastools.Prepare(t.Context(), &fakeOperations{}, "nastools.toml", c, environment())
+	_, err := nastools.Prepare(t.Context(), &nastoolstest.Fake{}, "nastools.toml", c, environment())
 	require.NoError(t, err)
 }

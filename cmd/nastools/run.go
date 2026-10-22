@@ -15,6 +15,7 @@ import (
 
 	"github.com/tbhb-dev/nastools/internal/buildmeta"
 	"github.com/tbhb-dev/nastools/internal/nastools"
+	"github.com/tbhb-dev/nastools/internal/redact"
 )
 
 // Exit statuses.
@@ -31,26 +32,30 @@ type streams struct {
 	err io.Writer
 }
 
-// Run executes the command and returns the process exit status.
+// Run executes the command and returns the process exit status. Every byte
+// of output passes the gate, which knows the discovered values before any.
 func Run(ctx context.Context, args []string, s streams, ops nastools.Operations, env map[string]string) int {
+	gate := redact.New(s.out, s.err, env["GITHUB_ACTIONS"] != "", redact.TailnetName)
+	ops = nastools.Cached(ops)
+	gate.Add(nastools.Discover(ops.ReadFile, configArgument(args), env)...)
+	code := exitError
+	if gate.Err() != nil {
+		fmt.Fprintln(gate.Stderr(), "nastools: mask output:", nastools.ErrInvalid)
+	} else {
+		code = run(ctx, args, streams{in: s.in, out: gate.Stdout(), err: gate.Stderr()}, ops, env)
+	}
+	if gate.Close() != nil {
+		return exitError
+	}
+	return code
+}
+
+func run(ctx context.Context, args []string, s streams, ops nastools.Operations, env map[string]string) int {
 	cmd := newRootCmd(ctx, s, ops, env)
 	cmd.SetArgs(args)
-
-	target, flags, findErr := cmd.Find(args)
-	remote := findErr == nil &&
-		slices.Contains([]string{nastools.CheckName, nastools.Deploy, "status", nastools.Logs}, target.Name())
-	if remote {
-		// Find the config even when flag parsing stops before reaching it.
-		target.InitDefaultHelpFlag()
-		parseErr := target.ParseFlags(flags)
-		if parseErr != nil || target.ValidateArgs(target.Flags().Args()) != nil || target.Flags().Changed("help") {
-			if _, err := nastools.Load(ops, configArgument(flags), env, s.out); err != nil {
-				fmt.Fprintln(s.err, "nastools:", err)
-				return exitError
-			}
-		}
-	}
-	if err := cmd.ExecuteContext(ctx); err != nil {
+	target, err := cmd.ExecuteContextC(ctx)
+	if err != nil {
+		remote := slices.Contains([]string{nastools.CheckName, nastools.Deploy, "status", nastools.Logs}, target.Name())
 		if remote && !errors.Is(err, nastools.ErrInvalid) {
 			err = nastools.ErrInvalid
 		}

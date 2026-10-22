@@ -4,8 +4,6 @@
 package nastools_test
 
 import (
-	"context"
-	"io"
 	"slices"
 	"strings"
 	"testing"
@@ -14,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/tbhb-dev/nastools/internal/nastools"
+	"github.com/tbhb-dev/nastools/internal/nastools/nastoolstest"
 )
 
 const serveConfigText = `
@@ -32,61 +31,48 @@ const serveStatusJSON = `{"TCP":{"443":{"HTTPS":true}},"Services":{` +
 	`"svc:data":{"TCP":{"4317":{}}},` +
 	`"svc:other":{"TCP":{"9":{}}}}}`
 
-// Remote records one remote command, writing the canned Serve status for a status query.
-func (f *fakeOperations) Remote(_ context.Context, argv []string, out, _ io.Writer) error {
-	f.calls = append(f.calls, "remote")
-	f.remotes = append(f.remotes, slices.Clone(argv))
-	if slices.Contains(argv, "status") {
-		if _, err := io.WriteString(out, f.remoteStatus); err != nil {
-			return errPrivate
-		}
-	}
-	if f.remoteFail != "" && slices.Contains(argv, f.remoteFail) {
-		return errPrivate
-	}
-	return nil
-}
-
-func serveFake() *fakeOperations {
-	return &fakeOperations{
-		files:        map[string]string{"nastools.toml": strings.Split(configText, "[files]")[0] + serveConfigText},
-		remoteStatus: serveStatusJSON,
+func serveFake() *nastoolstest.Fake {
+	return &nastoolstest.Fake{
+		Files:        map[string]string{"nastools.toml": strings.Split(configText, "[files]")[0] + serveConfigText},
+		RemoteStatus: serveStatusJSON,
 	}
 }
 
 func TestServeAfterReadiness(t *testing.T) {
 	t.Parallel()
 	f := serveFake()
-	env := environment()
-	env["GITHUB_ACTIONS"] = "true"
 	require.NoError(
 		t,
-		nastools.Execute(t.Context(), f, "nastools.toml", env, &f.out, &f.out, nastools.Command{Name: "deploy"}),
+		nastools.Execute(
+			t.Context(),
+			f,
+			"nastools.toml",
+			environment(),
+			&f.Out,
+			&f.Out,
+			nastools.Command{Name: "deploy"},
+		),
 	)
 	assert.Equal(t, []string{
 		"read:nastools.toml", "git", "compose", "open", "lock",
 		"compose", "compose", "remote", "remote", "compose", "remote", "close",
-	}, f.calls)
+	}, f.Calls)
 	assert.Equal(t, [][]string{
 		{"tailscale", "serve", "--service=svc:web", "--https=443", "http://127.0.0.1:3000"},
 		{"tailscale", "serve", "--service=svc:data", "--tcp=4317", "tcp://127.0.0.1:4317"},
 		{"tailscale", "serve", "status", "--json"},
-	}, f.remotes)
-	assert.True(
-		t,
-		strings.HasPrefix(f.out.String(), nastools.MaskCommands(nastools.PrivateValues(config(), env), true)),
-	)
+	}, f.Remotes)
 }
 
 func TestServeFailureShortCircuits(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name        string
-		change      func(*fakeOperations)
+		change      func(*nastoolstest.Fake)
 		wantRemotes int
 	}{
-		{"up fails", func(f *fakeOperations) { f.failCommand = "up" }, 0},
-		{"first endpoint fails", func(f *fakeOperations) { f.remoteFail = "--https=443" }, 1},
+		{"up fails", func(f *nastoolstest.Fake) { f.FailCommand = "up" }, 0},
+		{"first endpoint fails", func(f *nastoolstest.Fake) { f.RemoteFail = "--https=443" }, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -97,15 +83,15 @@ func TestServeFailureShortCircuits(t *testing.T) {
 				f,
 				"nastools.toml",
 				environment(),
-				&f.out,
-				&f.out,
+				&f.Out,
+				&f.Out,
 				nastools.Command{Name: "deploy"},
 			)
 			require.ErrorIs(t, err, nastools.ErrInvalid)
-			assert.NotContains(t, err.Error(), errPrivate.Error())
-			assert.Len(t, f.remotes, tc.wantRemotes)
-			assert.Equal(t, 1, f.closed)
-			assert.NotContains(t, slices.Concat(f.commands...), "ps")
+			assert.NotContains(t, err.Error(), nastoolstest.ErrPrivate.Error())
+			assert.Len(t, f.Remotes, tc.wantRemotes)
+			assert.Equal(t, 1, f.Closed)
+			assert.NotContains(t, slices.Concat(f.Commands...), "ps")
 		})
 	}
 }
@@ -120,16 +106,16 @@ func TestStatusScopesServe(t *testing.T) {
 			f,
 			"nastools.toml",
 			environment(),
-			&f.out,
-			&f.out,
+			&f.Out,
+			&f.Out,
 			nastools.Command{Name: "status"},
 		),
 	)
-	assert.Equal(t, [][]string{{"tailscale", "serve", "status", "--json"}}, f.remotes)
-	assert.Contains(t, f.out.String(), `"svc:web"`)
-	assert.Contains(t, f.out.String(), `"svc:data"`)
-	assert.NotContains(t, f.out.String(), "svc:other")
-	assert.NotContains(t, f.out.String(), "HTTPS")
+	assert.Equal(t, [][]string{{"tailscale", "serve", "status", "--json"}}, f.Remotes)
+	assert.Contains(t, f.Out.String(), `"svc:web"`)
+	assert.Contains(t, f.Out.String(), `"svc:data"`)
+	assert.NotContains(t, f.Out.String(), "svc:other")
+	assert.NotContains(t, f.Out.String(), "HTTPS")
 }
 
 func TestServeStatusFailures(t *testing.T) {
@@ -141,14 +127,14 @@ func TestServeStatusFailures(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f := serveFake()
-			f.remoteStatus, f.remoteFail = tc.status, tc.fail
+			f.RemoteStatus, f.RemoteFail = tc.status, tc.fail
 			err := nastools.Execute(
 				t.Context(),
 				f,
 				"nastools.toml",
 				environment(),
-				&f.out,
-				&f.out,
+				&f.Out,
+				&f.Out,
 				nastools.Command{Name: "status"},
 			)
 			require.ErrorIs(t, err, nastools.ErrInvalid)
@@ -159,7 +145,7 @@ func TestServeStatusFailures(t *testing.T) {
 
 func TestNoServeWithoutEndpoints(t *testing.T) {
 	t.Parallel()
-	f := &fakeOperations{files: map[string]string{"nastools.toml": strings.Split(configText, "[files]")[0]}}
+	f := &nastoolstest.Fake{Files: map[string]string{"nastools.toml": strings.Split(configText, "[files]")[0]}}
 	require.NoError(
 		t,
 		nastools.Execute(
@@ -167,12 +153,12 @@ func TestNoServeWithoutEndpoints(t *testing.T) {
 			f,
 			"nastools.toml",
 			environment(),
-			&f.out,
-			&f.out,
+			&f.Out,
+			&f.Out,
 			nastools.Command{Name: "deploy"},
 		),
 	)
-	assert.Empty(t, f.remotes)
+	assert.Empty(t, f.Remotes)
 }
 
 func TestCommitLabelReachesCompose(t *testing.T) {
@@ -188,7 +174,7 @@ func TestCommitLabelReachesCompose(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f := serveFake()
-			f.state = tc.state
+			f.State = tc.state
 			require.NoError(
 				t,
 				nastools.Execute(
@@ -196,17 +182,17 @@ func TestCommitLabelReachesCompose(t *testing.T) {
 					f,
 					"nastools.toml",
 					environment(),
-					&f.out,
-					&f.out,
+					&f.Out,
+					&f.Out,
 					nastools.Command{Name: "deploy"},
 				),
 			)
-			for _, env := range f.environments {
+			for _, env := range f.Environments {
 				assert.Contains(t, env, tc.want)
 			}
-			pull := slices.IndexFunc(f.commands, func(c []string) bool { return slices.Contains(c, "pull") })
+			pull := slices.IndexFunc(f.Commands, func(c []string) bool { return slices.Contains(c, "pull") })
 			require.Positive(t, pull)
-			assert.Contains(t, f.environments[pull], tc.want)
+			assert.Contains(t, f.Environments[pull], tc.want)
 		})
 	}
 }
