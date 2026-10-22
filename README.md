@@ -99,6 +99,53 @@ The deployment lock is `<lock directory>/<project>.lock`. An SSH session runs `f
 
 Before deployment use, network-attached storage qualification must verify host keys and agent authentication. It must also verify `sudo` without interaction, `flock` release on disconnect, and the pinned Compose/Engine combination.
 
+## Remote engine
+
+nastools runs Compose on the machine that runs nastools and points it at the device's engine through `DOCKER_HOST`. Each source in a Compose model comes either from that local machine or from the device, and Compose uses it at one fixed step, which the table names. These rows follow the Compose v5.6.1 source. Naming that release doesn't make it the oldest one nastools supports.
+
+| Source | Content comes from | Compose uses it |
+| --- | --- | --- |
+| `env_file`, the project `.env` file, and variable interpolation | The local machine | While parsing the model |
+| `configs` with `content:` or `environment:` sources, and `secrets` with `environment:` sources | The local machine | Copied into the container after Compose creates it and before it starts |
+| Local build contexts | The local machine | Sent to the engine when building |
+| Bind-mount sources and, outside swarm mode, `configs` and `secrets` with `file:` sources, which become bind mounts | The device, at the path resolved on the local machine | When the engine creates the container |
+
+Compose resolves a relative path against the project directory, which nastools sets to the config's directory. The engine then mounts that same absolute path from the device, so the file has to exist there at that path. A `file:` config or secret that's missing on the device fails container creation. For a `file:` secret that's missing on the local machine, Compose only warns, and it doesn't check a `file:` config there. A bind mount whose source is missing on the device doesn't fail: the engine creates an empty directory there, unless the long syntax sets `bind.create_host_path: false`. Because Compose reads `env_file` while parsing, it can never read an `env_file` that a service generates on the device. A missing `env_file` fails the parse unless it sets `required: false`, which only skips it.
+
+To generate a secret on the device, run an init one-shot that writes into a named volume only when the file is missing. Services mount the volume and read the secret as a file, and `depends_on` with `condition: service_completed_successfully` starts them after the init:
+
+```yaml
+services:
+  init-secrets:
+    image: busybox:1.37
+    command:
+      - sh
+      - -c
+      - test -s /secrets/token || { head -c 24 /dev/random | base64 > /secrets/token.tmp && mv /secrets/token.tmp /secrets/token; }
+    volumes:
+      - secrets:/secrets
+  example:
+    image: example.invalid/app
+    depends_on:
+      init-secrets:
+        condition: service_completed_successfully
+    volumes:
+      - secrets:/run/app-secrets:ro
+volumes:
+  secrets:
+```
+
+The guard matters because `up` starts the exited one-shot again on every deploy, and if the one-shot has the commit label, Compose recreates it on every commit. An init without the guard would replace the secret each time. Writing through a temporary file and `mv` keeps an interrupted init from leaving a partial secret that the guard would then keep. The secret lasts as long as the volume, and `compose down -v` removes both.
+
+File content can reach a service without a file on the device through these routes:
+
+- `configs.content`.
+- `configs.environment` or `secrets.environment`, fed from a `[files]` input.
+- An image built from a local build context.
+- An init one-shot that writes a volume from an environment variable.
+
+Each `[files]` value reaches Compose as one environment string, so the system running Compose limits its size. On Linux, the kernel limits one environment string, counting the name, the `=`, the value, and the ending null byte, to 32 pages. With 4 KiB pages that's 128 KiB, well below the 1 MiB file cap. macOS instead limits arguments and environment together, to the system's `ARG_MAX`. The init one-shot route also passes the value into the container's environment, so the device's Linux kernel applies the same per-string limit when the container process starts, and a larger macOS `ARG_MAX` doesn't raise that ceiling.
+
 ## Releases
 
 Pushing a `v*` tag starts the release workflow. It builds `nastools` for macOS and Linux on arm64 and amd64 through `mise run build`, retaining the version, commit, and date metadata. Each `nastools_<tag>_<os>_<arch>.tar.gz` archive contains the executable and `LICENSE`. The release includes `checksums.txt` with `sha256sum` hashes for the archives.
