@@ -75,6 +75,7 @@ type sshFixture struct {
 // against the fixture with its own project, lock, and Service IDs.
 func TestE2E(t *testing.T) {
 	t.Parallel()
+	t.Run("command-errors", testE2ECommandErrors)
 	f := startFixture(t)
 	t.Run("deploy", func(t *testing.T) {
 		t.Parallel()
@@ -698,8 +699,8 @@ func commandError(name string, err error) error {
 	return fixtureCommandError{name: filepath.Base(name), err: err}
 }
 
-func TestE2ECommandErrors(t *testing.T) {
-	t.Parallel()
+func testE2ECommandErrors(t *testing.T) {
+	t.Helper()
 	for _, helper := range []string{"output", "combined"} {
 		t.Run(helper, func(t *testing.T) {
 			t.Parallel()
