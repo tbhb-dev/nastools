@@ -8,6 +8,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -58,6 +59,22 @@ func example() {
 		"golang.org/x/sys/unix.Write", "golang.org/x/sys/unix.Stderr", "syscall.Syscall", "os.Stdout",
 		"println",
 	}, directOutput(t, file))
+}
+
+func TestSourcesSkipsAPMModules(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	firstParty := filepath.Join(root, "example.go")
+	require.NoError(t, os.WriteFile(firstParty, []byte("package example\n"), 0o600))
+	modules := filepath.Join(root, "apm_modules")
+	require.NoError(t, os.Mkdir(modules, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(modules, "example.go"), []byte(`package example
+
+func example() {
+	println("x")
+}
+`), 0o600))
+	assert.Equal(t, []string{firstParty}, sourcesFrom(t, root))
 }
 
 // directOutput lists each name that file uses, through any import name,
@@ -154,10 +171,14 @@ func TestNoStreamDevicePaths(t *testing.T) {
 	}
 }
 
-// sources lists every Go source outside tests, vendor, and main.go.
+// sources lists every Go source outside tests, third-party payload, and main.go.
 func sources(t *testing.T) []string {
 	t.Helper()
-	root := filepath.Join("..", "..")
+	return sourcesFrom(t, filepath.Join("..", ".."))
+}
+
+func sourcesFrom(t *testing.T, root string) []string {
+	t.Helper()
 	var paths []string
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
@@ -165,7 +186,8 @@ func sources(t *testing.T) []string {
 		}
 		name := entry.Name()
 		switch {
-		case entry.IsDir() && path != root && (name == "vendor" || strings.HasPrefix(name, ".")):
+		// `apm_modules` holds third-party payload that git ignores.
+		case entry.IsDir() && path != root && (name == "vendor" || name == "apm_modules" || strings.HasPrefix(name, ".")):
 			return filepath.SkipDir
 		case strings.HasSuffix(name, ".go") && !strings.HasSuffix(name, "_test.go") &&
 			filepath.ToSlash(path) != "../../cmd/nastools/main.go":
