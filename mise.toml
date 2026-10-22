@@ -18,9 +18,10 @@ jq = "1.8.2"
 # The devtools commands, at the release the payload comes from.
 # devtools:update-pins reads and moves these three lines, so they stay at
 # column 0 in this form.
-"go:github.com/tbhb-dev/devtools/cmd/guard-markdown" = "v0.14.0"
-"go:github.com/tbhb-dev/devtools/cmd/commit-lint" = "v0.14.0"
-"go:github.com/tbhb-dev/devtools/cmd/agentrepo" = "v0.14.0"
+"go:github.com/tbhb-dev/devtools/cmd/guard-markdown" = "v0.15.0"
+"go:github.com/tbhb-dev/devtools/cmd/commit-lint" = "v0.15.0"
+"go:github.com/tbhb-dev/devtools/cmd/agentrepo" = "v0.15.0"
+"go:github.com/tbhb-dev/devtools/cmd/gh-post" = "v0.15.0"
 
 [env]
 DEVTOOLS_LOCK_PLATFORMS = "linux-x64,macos-arm64"
