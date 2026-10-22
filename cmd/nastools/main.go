@@ -9,7 +9,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"os"
@@ -258,8 +257,9 @@ func (o *operations) acquire(ctx context.Context, refused *pooledClient) (*poole
 // leaves the pool and another one serves the request. When the server refuses
 // the channel on a live connection, at its session limit say, the connection
 // stays in the pool and the request gets one retry on another. A fresh
-// connection that fails ends the attempt. Cancelling the context closes the
-// connection opening the session, since a silently dead one never answers.
+// connection that fails ends the attempt. Cancelling the context or reaching
+// the handshake time limit closes the connection opening the session, since a
+// silently dead one never answers.
 func (o *operations) newSession(ctx context.Context) (*ssh.Session, *pooledClient, error) {
 	var refused *pooledClient
 	for {
@@ -267,16 +267,15 @@ func (o *operations) newSession(ctx context.Context) (*ssh.Session, *pooledClien
 		if err != nil {
 			return nil, nil, err
 		}
-		session, err := openSession(ctx, pooled.client)
+		session, channelRefused, err := openSession(ctx, pooled.client)
 		if err == nil {
 			return session, pooled, nil
 		}
 		cancelled := ctx.Err() != nil
-		var channelErr *ssh.OpenChannelError
-		if errors.As(err, &channelErr) && !cancelled {
+		if channelRefused && !cancelled {
 			o.release(pooled)
 			if dialed || refused != nil {
-				return nil, nil, sanitized(err)
+				return nil, nil, err
 			}
 			refused = pooled
 			continue
@@ -286,29 +285,26 @@ func (o *operations) newSession(ctx context.Context) (*ssh.Session, *pooledClien
 		o.mu.Unlock()
 		_ = pooled.client.Close()
 		if dialed || cancelled {
-			return nil, nil, sanitized(err)
+			return nil, nil, err
 		}
 	}
 }
 
-// openSession closes the client when the context ends, which unblocks
-// NewSession on a connection that stopped answering. A session that opened as
-// the context ended reports the context error, because its connection is
-// already closing.
-func openSession(ctx context.Context, client *ssh.Client) (*ssh.Session, error) {
+// openSession closes the client when the context ends or the handshake time
+// limit passes, which unblocks NewSession on a connection that stopped
+// answering. A session that opened as the limit ended reports the context
+// error, because its connection is already closing. It also reports whether the
+// server refused the channel, which leaves the connection alive.
+func openSession(ctx context.Context, client *ssh.Client) (*ssh.Session, bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, sshHandshakeTimeout)
+	defer cancel()
 	stop := context.AfterFunc(ctx, func() { _ = client.Close() })
 	session, err := client.NewSession()
-	if stop() {
-		return session, wrapOpen(err)
+	if !stop() {
+		return nil, false, sanitized(ctx.Err())
 	}
-	return nil, wrapOpen(ctx.Err())
-}
-
-func wrapOpen(err error) error {
-	if err != nil {
-		return fmt.Errorf("open session: %w", err)
-	}
-	return nil
+	var channelErr *ssh.OpenChannelError
+	return session, errors.As(err, &channelErr), sanitized(err)
 }
 
 func (o *operations) release(pooled *pooledClient) {
