@@ -179,11 +179,11 @@ linters:
         - switch
         - map
 
-    # Process output passes the redact gate. Only cmd/nastools/main.go holds
-    # the process streams; see the exclusion rule below. Type analysis
-    # matches package names, so an import alias doesn't hide a call.
-    # internal/redact/guard_test.go repeats these checks with the AST and
-    # rejects device paths.
+    # Process output passes the redact gate. Only the main function in
+    # cmd/nastools/main.go holds the process streams; see the exclusion rule
+    # below. Type analysis matches package names, so an import alias doesn't
+    # hide a call. internal/redact/guard_test.go repeats these checks with
+    # the AST and rejects device paths.
     forbidigo:
       analyze-types: true
       forbid:
@@ -361,6 +361,8 @@ linters:
         linters:
           - funlen
           - goconst
-      # main.go hands the process streams to Run, which gates them.
+      # main hands the process streams to Run, which gates them. Only that
+      # line is exempt; the guard test pins the rest of main.go.
       - path: ^cmd/nastools/main\.go$
+        source: '^\s*streams\{in: os\.Stdin, out: os\.Stdout, err: os\.Stderr\},$'
         linters: [forbidigo]

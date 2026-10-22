@@ -283,6 +283,21 @@ func TestTrailingNewlineValue(t *testing.T) {
 	assert.Equal(t, "*** *** *** x *** *** ***\n", text(*log, "err"))
 }
 
+// TestPaddedValue checks that a single-line value with surrounding spaces
+// or tabs is redacted where it appears bare, and that a value of only
+// whitespace registers nothing.
+func TestPaddedValue(t *testing.T) {
+	t.Parallel()
+	g, log := gate(0)
+	g.Register(redact.Set{Values: []string{"\t" + secret, "padded-token ", " \t "}})
+	_, err := io.WriteString(g.Stderr(), "a "+secret+" b padded-token\n")
+	require.NoError(t, err)
+	require.NoError(t, g.Close())
+	assert.Equal(t, maskPrefix+"\t"+secret+"\n"+maskPrefix+secret+"\n"+
+		maskPrefix+"padded-token \n"+maskPrefix+"padded-token\n", text(*log, "out"))
+	assert.Equal(t, "a *** b ***\n", text(*log, "err"))
+}
+
 func TestCloseReportsFlushMaskFailure(t *testing.T) {
 	t.Parallel()
 	g, log := gate(1)
