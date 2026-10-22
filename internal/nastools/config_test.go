@@ -23,8 +23,8 @@ func TestConfigPolicy(t *testing.T) {
 	}{
 		{"project traversal", func(c *nastools.Config) { c.Project = "../example" }, "project"},
 		{"project shell", func(c *nastools.Config) { c.Project = "example;id" }, "project"},
-		{"lock directory missing", func(c *nastools.Config) { c.SSH.LockDir = "" }, "ssh.lock_dir"},
-		{"lock directory relative", func(c *nastools.Config) { c.SSH.LockDir = "locks" }, "ssh.lock_dir"},
+		{"lock directory missing", func(c *nastools.Config) { c.SSH.LockDir = nil }, "ssh.lock_dir"},
+		{"lock directory relative", func(c *nastools.Config) { c.SSH.LockDir = new("locks") }, "ssh.lock_dir"},
 		{"project", func(c *nastools.Config) { c.Project = "" }, "project"},
 		{"compose absent", func(c *nastools.Config) { c.Compose = nil }, "compose"},
 		{"compose empty", func(c *nastools.Config) { c.Compose = []string{""} }, "compose"},
@@ -63,17 +63,19 @@ func TestLockDirPolicy(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name   string
-		dir    string
-		dirEnv string
+		dir    *string
+		dirEnv *string
 		value  string
 		want   string
 	}{
-		{"literal", "/example.invalid/locks", "", "/lock.example.invalid", "/example.invalid/locks"},
-		{"variable", "", "SSH_LOCK_DIR", "/lock.example.invalid", "/lock.example.invalid"},
-		{"both", "/example.invalid/locks", "SSH_LOCK_DIR", "/lock.example.invalid", ""},
-		{"neither", "", "", "/lock.example.invalid", ""},
-		{"variable empty", "", "SSH_LOCK_DIR", "", ""},
-		{"variable relative", "", "SSH_LOCK_DIR", "lock.example.invalid", ""},
+		{"literal", new("/example.invalid/locks"), nil, "/lock.example.invalid", "/example.invalid/locks"},
+		{"variable", nil, new("SSH_LOCK_DIR"), "/lock.example.invalid", "/lock.example.invalid"},
+		{"both", new("/example.invalid/locks"), new("SSH_LOCK_DIR"), "/lock.example.invalid", ""},
+		{"both, literal empty", new(""), new("SSH_LOCK_DIR"), "/lock.example.invalid", ""},
+		{"both, variable name empty", new("/example.invalid/locks"), new(""), "/lock.example.invalid", ""},
+		{"neither", nil, nil, "/lock.example.invalid", ""},
+		{"variable empty", nil, new("SSH_LOCK_DIR"), "", ""},
+		{"variable relative", nil, new("SSH_LOCK_DIR"), "lock.example.invalid", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -87,7 +89,7 @@ func TestLockDirPolicy(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
-			assert.Equal(t, tc.want, got.Config.SSH.LockDir)
+			assert.Equal(t, tc.want, *got.Config.SSH.LockDir)
 		})
 	}
 }

@@ -42,6 +42,9 @@ target = "http://127.0.0.1:3000"
 `
 )
 
+// relativeLockDir is private only to the fixture whose config names it.
+const relativeLockDir = "secret-9.example.invalid/locks"
+
 // canaries lists every private value of the fixture, in the forms that
 // nastools output could contain.
 func canaries() []string {
@@ -62,7 +65,7 @@ func matrixEnv() map[string]string {
 		"SSH_KNOWN_HOSTS": "secret-4.example.invalid ssh-ed25519 " +
 			"AAAAC3NzaC1lZDI1NTE5AAAAICZ4niA2YR6ErsZQRahQYkioleR/p9/qUOStEMhVy/K5\n",
 		"SSH_LOCK_DIR":      lockDir,
-		"RELATIVE_LOCK_DIR": "secret-9.example.invalid/locks",
+		"RELATIVE_LOCK_DIR": relativeLockDir,
 		"TEMPLATE_INPUT":    "secret-5.example.invalid",
 	}
 }
@@ -80,8 +83,9 @@ func matrixFake() *nastoolstest.Fake {
 }
 
 // fixture changes the config or injects a fault. unmasked lists the values
-// whose only source the change removes. broken marks a config that fails
-// the strict parse.
+// whose only source the change removes. A canary the change adds to the
+// fake is private and must be masked. broken marks a config that fails the
+// strict parse.
 type fixture struct {
 	name     string
 	change   func(*nastoolstest.Fake)
@@ -119,7 +123,10 @@ func fixtures() []fixture {
 		}, []string{lockDir}, false},
 		{"lock_dir_env malformed", replace(`lock_dir_env =`, `lock_dir_env = =`), nil, true},
 		{"lock_dir_env missing", replace(`"SSH_LOCK_DIR"`, `"ABSENT_LOCK_DIR"`), []string{lockDir}, false},
-		{"lock_dir_env relative", replace(`"SSH_LOCK_DIR"`, `"RELATIVE_LOCK_DIR"`), []string{lockDir}, false},
+		{"lock_dir_env relative", func(f *nastoolstest.Fake) {
+			replace(`"SSH_LOCK_DIR"`, `"RELATIVE_LOCK_DIR"`)(f)
+			f.Canaries = append(f.Canaries, relativeLockDir)
+		}, []string{lockDir}, false},
 		{"both lock keys", replace("[ssh]", "[ssh]\nlock_dir = \"/example.invalid/locks\""), nil, false},
 		{"invalid serve", replace("https = 443", "https = 0"), nil, false},
 		{"duplicate output", replace("EXPANDED_INPUT =", "STATIC_INPUT ="), nil, false},
@@ -257,6 +264,8 @@ func matrixCases() []matrixCase {
 		"extra argument": {canary, canary},
 		// The template references this value, so only discovery knows it.
 		"template value": {"secret-5.example.invalid", "secret-5.example.invalid"},
+		// Only the relative lock directory fixture makes this value private.
+		"lock dir value": {relativeLockDir, relativeLockDir},
 		"help":           {"--help"},
 		"short help":     {"-h"},
 		"missing config": {"--config=missing.toml"},
@@ -292,18 +301,24 @@ func TestRunNeverPrintsPrivateValues(t *testing.T) {
 			t.Parallel()
 			f := matrixFake()
 			tc.fixture.change(f)
+			added := slices.DeleteFunc(slices.Clone(f.Canaries), func(value string) bool {
+				return slices.Contains(canaries(), value)
+			})
 			out, errOut := &faultyWriter{failAt: tc.failAt}, &faultyWriter{}
 			code := Run(t.Context(), tc.args, streams{in: strings.NewReader(""), out: out, err: errOut}, f,
 				matrixEnv())
 			masks := map[string]bool{"secret-6.example.invalid": true}
 			if !tc.noConfig {
 				masks = expectedMasks(tc.fixture.unmasked)
+				for _, value := range added {
+					masks[value] = true
+				}
 			}
 			// nastools can't know a value whose only source it can't read, so
 			// it may echo that value from its arguments.
-			private := slices.DeleteFunc(canaries(), func(value string) bool {
+			private := append(slices.DeleteFunc(canaries(), func(value string) bool {
 				return slices.Contains(tc.fixture.unmasked, value) && slices.Contains(tc.args, value)
-			})
+			}), added...)
 			assertGated(t, out, errOut.String(), masks, private)
 			if out.maskFailed {
 				assert.NotEqual(t, exitOK, code)
