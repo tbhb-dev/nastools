@@ -1,12 +1,8 @@
-# Review routing for nastools. GitHub applies the last matching rule, so the
-# supply-chain rules below override the default for the paths they name.
+# Review routing for nastools. This file lists only the files where every
+# change needs the owner. Workflows are not listed: only some workflow
+# changes need the owner, such as permissions and triggers, and a
+# decisioning agent will classify those.
 
-# Default owner for everything.
-*           @tbhb
-
-# Supply-chain and CI surface. The /.github/ rule already covers
-# renovate.json5 and every workflow, so neither needs its own line.
-/.github/   @tbhb
-/go.mod     @tbhb
-/go.sum     @tbhb
-/vendor/    @tbhb
+/.github/CODEOWNERS           @tbhb
+/.agents/agent-skills.conf    @tbhb
+/.claude/settings*.json       @tbhb
