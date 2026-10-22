@@ -61,23 +61,24 @@ With no other grant for the Service, a local network client and a node without t
 
 ## Bootstrap a repository
 
-Append-only mode permits creating a repository, so initialize a fresh one from the client. Pass the credentials through the environment to keep them out of the URL and the shell history:
+Append-only mode permits creating a repository, so initialize a fresh one from the client. Pass the credentials through the environment to keep them out of the URL and the shell history. The REST backend reads the HTTP password from `RESTIC_REST_PASSWORD` and has no file variant, so read the client password from its file inside the shell without putting the literal on the command line:
 
 ```sh
 export RESTIC_REPOSITORY=rest:https://rest-server.example.invalid/repo
 export RESTIC_REST_USERNAME=client
-export RESTIC_REST_PASSWORD_FILE=/path/to/client-password
+RESTIC_REST_PASSWORD=$(cat /path/to/client-password)
+export RESTIC_REST_PASSWORD
 export RESTIC_PASSWORD_FILE=/path/to/repository-password
 restic init
 restic backup /path/to/data
 restic snapshots
 ```
 
-Replace the repository URL with the address of the Service. The client password matches the `htpasswd` entry. The repository password is a different secret.
+Replace the repository URL with the address of the Service. `RESTIC_REST_USERNAME` and `RESTIC_REST_PASSWORD` are the HTTP credential and match the `htpasswd` entry. `RESTIC_PASSWORD_FILE` supplies the repository encryption password, a different secret that restic never sends to the server. `RESTIC_PASSWORD` works for it too. Without `RESTIC_REST_PASSWORD`, the client sends an empty HTTP password and the server answers 401 before `restic init` starts. To read the client password from a password manager instead, assign the output of its read command to `RESTIC_REST_PASSWORD` the same way.
 
 ## Restore
 
-Restore from the client into a scratch directory, then compare checksums against the source:
+Restore from the client into a scratch directory, then compare checksums against the source. Use the same shell as the bootstrap, or set `RESTIC_REPOSITORY`, `RESTIC_REST_USERNAME`, `RESTIC_REST_PASSWORD` and `RESTIC_PASSWORD_FILE` again as shown there:
 
 ```sh
 restic restore latest --target /path/to/scratch
@@ -85,11 +86,11 @@ restic restore latest --target /path/to/scratch
 
 ## Verify append-only mode
 
-Run these from the client with the client credential. Each must fail:
+Run these from the client with the environment of the bootstrap, which holds the client credential in `RESTIC_REST_PASSWORD` and the repository password in `RESTIC_PASSWORD_FILE`. Each must fail:
 
 - `restic forget <snapshot ID>` on a disposable snapshot fails with a permission error, because the server refuses to delete a snapshot file.
 - Overwriting an existing object in the repository fails, because the server refuses to replace a file that exists.
-- A request with a wrong password gets a 401 response.
+- A request with a wrong `RESTIC_REST_PASSWORD` gets a 401 response.
 
 `restic backup` and `restic snapshots` still work with the same credential.
 
