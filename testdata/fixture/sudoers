@@ -1,0 +1,4 @@
+# The fixture user may run the engine forwarder, and only that, without a
+# password.
+Defaults:nastools !authenticate
+nastools ALL=(root) /usr/local/bin/docker system dial-stdio

@@ -1,0 +1,22 @@
+# The sample project's configuration. The end-to-end test copies the project
+# into a new Git repository and replaces each nastools-e2e below with a name
+# unique to the run, so every run has its own project, lock, and Service IDs.
+project = "nastools-e2e"
+compose = ["compose.yaml"]
+wait_seconds = 120
+
+[ssh]
+address_env = "NASTOOLS_E2E_ADDRESS"
+user_env = "NASTOOLS_E2E_USER"
+known_hosts_env = "NASTOOLS_E2E_KNOWN_HOSTS"
+lock_dir = "/var/lib/nastools/locks"
+
+[[serve]]
+service = "svc:nastools-e2e-web"
+https = 443
+target = "http://127.0.0.1:8080"
+
+[[serve]]
+service = "svc:nastools-e2e-worker"
+tcp = 5432
+target = "tcp://127.0.0.1:5432"

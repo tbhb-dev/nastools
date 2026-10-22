@@ -146,6 +146,41 @@ File content can reach a service without a file on the device through these rout
 
 Each `[files]` value reaches Compose as one environment string, so the system running Compose limits its size. On Linux, the kernel limits one environment string, counting the name, the `=`, the value, and the ending null byte, to 32 pages. With 4 KiB pages that's 128 KiB, well below the 1 MiB file cap. macOS instead limits arguments and environment together, to the system's `ARG_MAX`. The init one-shot route also passes the value into the container's environment, so the device's Linux kernel applies the same per-string limit when the container process starts, and a larger macOS `ARG_MAX` doesn't raise that ceiling.
 
+## Rehearse a deploy
+
+The SSH engine fixture in `testdata/fixture/` is the supported way to rehearse a deploy against a local Docker engine. It's a container image that runs `sshd` with public-key authentication only, for the user `nastools`. That user may run exactly `sudo -n /usr/local/bin/docker system dial-stdio` without a password, and the Docker command-line tool inside reaches the local engine through its mounted socket. Besides `flock` and the lock directory `/var/lib/nastools/locks`, the image provides a `tailscale` stub. It records each `tailscale serve` command in `/var/lib/nastools/serve.log` and answers `tailscale serve status --json` from that log. A rehearsal records Serve entries without applying them.
+
+Keys don't come with the image. Generate a host key and a client key, copy the host key and the client's public key into the container before it starts, and publish `sshd` on `127.0.0.1`:
+
+```sh
+ssh-keygen -q -t ed25519 -N '' -f fixture_host_key
+ssh-keygen -q -t ed25519 -N '' -f fixture_client_key
+docker build --tag nastools-fixture testdata/fixture
+docker create --name nastools-fixture --publish 127.0.0.1:2222:22 \
+  --volume /var/run/docker.sock:/var/run/docker.sock nastools-fixture
+docker cp fixture_host_key nastools-fixture:/etc/ssh/ssh_host_ed25519_key
+docker cp fixture_client_key.pub nastools-fixture:/home/nastools/.ssh/authorized_keys
+docker start nastools-fixture
+```
+
+nastools reads the client key only from the agent at `SSH_AUTH_SOCK`, and it checks the host key against the known-hosts input. With the SSH section of the example config, the inputs are:
+
+```sh
+eval "$(ssh-agent -s)"
+ssh-add fixture_client_key
+export SSH_ADDRESS=127.0.0.1:2222
+export SSH_USER=nastools
+export SSH_KNOWN_HOSTS="[127.0.0.1]:2222 $(cat fixture_host_key.pub)"
+export SSH_LOCK_DIR=/var/lib/nastools/locks
+nastools deploy --config path/to/nastools.toml
+```
+
+A known-hosts entry for a port other than 22 puts the host in brackets. Afterwards, run `docker compose --project-name <project> down` against the local engine, remove the container with `docker rm --force nastools-fixture`, and stop the agent with `ssh-agent -k`.
+
+Mounting the socket gives the fixture full control of the local engine. Publish its port on `127.0.0.1` only, and use keys made for the rehearsal. Because the fixture's engine is the local one, bind-mount sources and `file:` configs and secrets resolve on this machine. A rehearsal doesn't show that they exist on the device, and it doesn't replace the device qualification that the Serve section describes.
+
+`mise run test-e2e` builds the fixture and runs `check`, `deploy`, `status`, and `logs` through it against the sample project in `testdata/fixture/project/`. It also covers lock contention, the release of the lock a killed deploy held, and a host key mismatch. It needs a Docker engine, and CI runs it on Linux.
+
 ## Releases
 
 Pushing a `v*` tag starts the release workflow. It builds `nastools` for macOS and Linux on arm64 and amd64 through `mise run build`, retaining the version, commit, and date metadata. Each `nastools_<tag>_<os>_<arch>.tar.gz` archive contains the executable and `LICENSE`. The release includes `checksums.txt` with `sha256sum` hashes for the archives.

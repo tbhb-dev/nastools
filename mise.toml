@@ -208,8 +208,12 @@ fi
 description = "Run devtools:build"
 run = "mise run devtools:build"
 
+# GOFLAGS carries the e2e build tag to every Go lint gate the aggregate
+# runs, so they all see cmd/nastools/e2e_test.go. The test tasks leave the
+# tag off, which keeps `mise run test` independent of Docker.
 [tasks.lint-go-all]
 description = "Run devtools:lint-go-all"
+env = { GOFLAGS = "-tags=e2e" }
 run = "mise run devtools:lint-go-all"
 
 [tasks.lint-go-arch]
@@ -227,6 +231,15 @@ run = "mise run devtools:test-go"
 [tasks.test-go-race]
 description = "Run devtools:test-go-race"
 run = "mise run devtools:test-go-race"
+
+# The test builds nastools and the SSH engine fixture in testdata/fixture/,
+# generates a throwaway client and host key, serves the client key from a
+# private agent, writes the known-hosts entry, and starts the fixture on a
+# loopback port before it deploys the sample project. Engine resources take
+# the name prefix NASTOOLS_E2E_PREFIX, nastools-e2e by default.
+[tasks.test-e2e]
+description = "Run the end-to-end deploy test against the SSH engine fixture"
+run = "go test -tags e2e -count=1 -timeout 15m -run '^TestE2E$' -v ./cmd/nastools"
 
 [tasks.cover-go]
 description = "Run devtools:cover-go"
