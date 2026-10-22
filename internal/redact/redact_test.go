@@ -283,6 +283,35 @@ func TestTrailingNewlineValue(t *testing.T) {
 	assert.Equal(t, "*** *** *** x *** *** ***\n", text(*log, "err"))
 }
 
+// TestPaddedValue checks that a single-line value with surrounding spaces
+// or tabs is redacted where it appears bare, and that a value of only
+// whitespace registers nothing.
+func TestPaddedValue(t *testing.T) {
+	t.Parallel()
+	g, log := gate(0)
+	g.Register(redact.Set{Values: []string{"\t" + secret, "padded-token ", " \t "}})
+	_, err := io.WriteString(g.Stderr(), "a "+secret+" b padded-token\n")
+	require.NoError(t, err)
+	require.NoError(t, g.Close())
+	assert.Equal(t, maskPrefix+"\t"+secret+"\n"+maskPrefix+secret+"\n"+
+		maskPrefix+"padded-token \n"+maskPrefix+"padded-token\n", text(*log, "out"))
+	assert.Equal(t, "a *** b ***\n", text(*log, "err"))
+}
+
+// TestPaddedValueTrimmedMinimum checks that the trimmed form of a padded
+// value follows the eight-byte floor: at seven bytes only the padded
+// form is redacted, and at eight the bare form is too.
+func TestPaddedValueTrimmedMinimum(t *testing.T) {
+	t.Parallel()
+	g, log := gate(0)
+	g.Register(redact.Set{Values: []string{"\ttoken-7", "\ttoken-08"}})
+	_, err := io.WriteString(g.Stderr(), "a token-7 b token-08 c\ttoken-7\n")
+	require.NoError(t, err)
+	require.NoError(t, g.Close())
+	assert.Equal(t, maskPrefix+"\ttoken-7\n"+maskPrefix+"\ttoken-08\n"+maskPrefix+"token-08\n", text(*log, "out"))
+	assert.Equal(t, "a token-7 b *** c***\n", text(*log, "err"))
+}
+
 func TestCloseReportsFlushMaskFailure(t *testing.T) {
 	t.Parallel()
 	g, log := gate(1)
