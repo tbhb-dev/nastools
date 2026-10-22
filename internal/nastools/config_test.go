@@ -53,6 +53,11 @@ func TestConfigPolicy(t *testing.T) {
 			require.ErrorIs(t, err, nastools.ErrInvalid)
 			assert.Contains(t, err.Error(), tc.field)
 			assert.NotContains(t, err.Error(), "private.example.invalid")
+			if tc.field == "files.INPUT" {
+				// The overriding template is still read so its references get masked.
+				assert.Equal(t, []string{"read:expanded"}, f.calls)
+				return
+			}
 			assert.Empty(t, f.calls)
 		})
 	}

@@ -342,7 +342,64 @@ func TestExpansionFailureOrder(t *testing.T) {
 	f := &fakeOperations{files: map[string]string{"a.txt": "$MISSING"}}
 	_, err := nastools.Prepare(t.Context(), f, "nastools.toml", c, environment())
 	require.ErrorContains(t, err, "expand_files.A_INPUT")
-	assert.Equal(t, []string{"read:a.txt"}, f.calls)
+	assert.Equal(t, []string{"read:a.txt", "read:b.txt"}, f.calls)
+}
+
+func TestMasksCoverEveryReadableTemplate(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		files map[string]string
+		a     string
+	}{
+		{"missing variable", map[string]string{"a.txt": "$MISSING", "b.txt": "${EXTRA_INPUT}"}, "a.txt"},
+		{"unreadable file", map[string]string{"b.txt": "${EXTRA_INPUT}"}, "a.txt"},
+		{"empty path", map[string]string{"b.txt": "${EXTRA_INPUT}"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := config()
+			c.ExpandFiles = map[string]string{"A_INPUT": tc.a, "B_INPUT": "b.txt"}
+			tc.files["nastools.toml"] = "project = \"example\""
+			f := &fakeOperations{files: tc.files}
+			env := environment()
+			env["EXTRA_INPUT"] = "extra.example.invalid"
+			env["GITHUB_ACTIONS"] = "true"
+			var out bytes.Buffer
+			require.NoError(t, nastools.MaskReferenced(f, "nastools.toml", c, env, &out))
+			assert.Equal(t, "::add-mask::extra.example.invalid\n", out.String())
+
+			_, err := nastools.Prepare(t.Context(), f, "nastools.toml", c, env)
+			require.ErrorIs(t, err, nastools.ErrInvalid)
+			assert.NotContains(t, err.Error(), "extra.example.invalid")
+		})
+	}
+}
+
+func TestDuplicateOutputKeepsTemplateMasks(t *testing.T) {
+	t.Parallel()
+	c := config()
+	c.Files = map[string]string{"A_INPUT": "static.txt"}
+	c.ExpandFiles = map[string]string{"A_INPUT": "a.txt"}
+	f := &fakeOperations{files: map[string]string{"a.txt": "${EXTRA_INPUT}"}}
+	env := environment()
+	env["EXTRA_INPUT"] = "extra.example.invalid"
+	inputs, err := nastools.Prepare(t.Context(), f, "nastools.toml", c, env)
+	require.ErrorContains(t, err, "duplicate output")
+	assert.Equal(t, []string{"extra.example.invalid"}, inputs.Referenced)
+}
+
+func TestMaskReferencedWriteFailure(t *testing.T) {
+	t.Parallel()
+	c := config()
+	c.ExpandFiles = map[string]string{"A_INPUT": "a.txt"}
+	f := &fakeOperations{files: map[string]string{"a.txt": "${EXTRA_INPUT}"}}
+	env := environment()
+	env["EXTRA_INPUT"] = "extra.example.invalid"
+	env["GITHUB_ACTIONS"] = "true"
+	err := nastools.MaskReferenced(f, "nastools.toml", c, env, failingWriter{})
+	require.ErrorIs(t, err, nastools.ErrInvalid)
+	assert.NotContains(t, err.Error(), "extra.example.invalid")
 }
 
 func (f *fakeOperations) Open(_ context.Context, config nastools.SSH, env map[string]string) (string, error) {

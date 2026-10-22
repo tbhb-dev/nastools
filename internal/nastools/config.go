@@ -230,42 +230,75 @@ func Prepare(ctx context.Context, ops Operations, path string, c Config, env map
 	return inputs, nil
 }
 
-// fileEnvironment records in referenced every value an expanded file reads.
+// fileEnvironment records in referenced every value an expanded file reads. It
+// reads every template before it reports the first file error, so the caller
+// can mask the values of each readable template even when another one fails.
 func (c Config) fileEnvironment(
 	ops Operations, dir string, env map[string]string, referenced map[string]bool,
 ) (map[string]string, error) {
+	var firstErr error
 	paths := make(map[string]string)
 	maps.Copy(paths, c.Files)
 	for _, name := range slices.Sorted(maps.Keys(c.ExpandFiles)) {
 		if _, duplicate := c.Files[name]; duplicate {
-			return nil, fmt.Errorf("files.%s: duplicate output: %w", name, ErrInvalid)
+			firstErr = fmt.Errorf("files.%s: duplicate output: %w", name, ErrInvalid)
 		}
 		paths[name] = c.ExpandFiles[name]
 	}
 	child := maps.Clone(env)
 	for _, name := range slices.Sorted(maps.Keys(paths)) {
-		if name == "" || paths[name] == "" {
-			return nil, fmt.Errorf("files: %w", ErrInvalid)
-		}
-		data, err := ops.ReadFile(resolve(dir, paths[name]))
-		if err != nil {
-			return nil, fmt.Errorf("files.%s: unreadable input: %w", name, ErrInvalid)
-		}
-		child[name] = string(data)
-		if _, expand := c.ExpandFiles[name]; !expand {
-			continue
-		}
-		var missing bool
-		child[name] = os.Expand(child[name], func(key string) string {
-			missing = missing || env[key] == ""
-			referenced[env[key]] = true
-			return env[key]
-		})
-		if missing {
-			return nil, fmt.Errorf("expand_files.%s: %w", name, ErrInvalid)
+		value, err := c.readInput(ops, dir, name, paths[name], env, referenced)
+		if err == nil {
+			child[name] = value
+		} else if firstErr == nil {
+			firstErr = err
 		}
 	}
-	return child, nil
+	return child, firstErr
+}
+
+// readInput returns the file text, expanded for a template.
+func (c Config) readInput(
+	ops Operations, dir, name, path string, env map[string]string, referenced map[string]bool,
+) (string, error) {
+	if name == "" || path == "" {
+		return "", fmt.Errorf("files: %w", ErrInvalid)
+	}
+	data, err := ops.ReadFile(resolve(dir, path))
+	if err != nil {
+		return "", fmt.Errorf("files.%s: unreadable input: %w", name, ErrInvalid)
+	}
+	if _, expand := c.ExpandFiles[name]; !expand {
+		return string(data), nil
+	}
+	var missing bool
+	value := os.Expand(string(data), func(key string) string {
+		missing = missing || env[key] == ""
+		referenced[env[key]] = true
+		return env[key]
+	})
+	if missing {
+		return "", fmt.Errorf("expand_files.%s: %w", name, ErrInvalid)
+	}
+	return value, nil
+}
+
+// MaskReferenced masks the values that expanded file templates read. Paths that
+// stop before Prepare use it, since they print before any command runs.
+func MaskReferenced(ops Operations, path string, c Config, env map[string]string, out io.Writer) error {
+	referenced := make(map[string]bool)
+	_, fileErr := c.fileEnvironment(ops, filepath.Dir(path), env, referenced)
+	_ = fileErr // The command reports a file error when it runs. This path only masks.
+	delete(referenced, "")
+	return maskReferenced(out, c, slices.Sorted(maps.Keys(referenced)), env)
+}
+
+// maskReferenced skips the values that the declared inputs already masked.
+func maskReferenced(out io.Writer, c Config, referenced []string, env map[string]string) error {
+	private := PrivateValues(c, env)
+	return maskOutput(out, slices.DeleteFunc(slices.Clone(referenced), func(value string) bool {
+		return slices.Contains(private, value)
+	}), env)
 }
 
 func childEnvironment(env map[string]string) []string {
@@ -327,10 +360,7 @@ func prepared(ctx context.Context, ops Operations, path string, env map[string]s
 	}
 	inputs, err := Prepare(ctx, ops, path, config, env)
 	// Templates can read variables beyond the declared inputs, even on a failing path.
-	private := PrivateValues(config, env)
-	if maskErr := maskOutput(out, slices.DeleteFunc(slices.Clone(inputs.Referenced), func(value string) bool {
-		return slices.Contains(private, value)
-	}), env); maskErr != nil {
+	if maskErr := maskReferenced(out, config, inputs.Referenced, env); maskErr != nil {
 		return Inputs{}, maskErr
 	}
 	return inputs, err
