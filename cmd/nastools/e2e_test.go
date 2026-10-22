@@ -189,6 +189,10 @@ func testHostKeyMismatch(t *testing.T, f *sshFixture) {
 	mismatch, control := "mismatch-"+randomSuffix(), "control-"+randomSuffix()
 	const mismatchLog = "/var/lib/nastools/mismatch.log"
 	mustOutput(t, "docker", "exec", f.container, "/usr/sbin/sshd", "-p", "2222", "-E", mismatchLog)
+	waitFor(t, "the mismatch listener to start", func() bool {
+		log := mustOutput(t, "docker", "exec", f.container, "cat", mismatchLog)
+		return strings.Contains(log, "Server listening on")
+	})
 	s.address = f.mismatchAddress
 	wrong := knownhosts.Line([]string{s.address}, publicKey(t, newKey(t)))
 	r := s.run(t, options{user: mismatch, knownHosts: wrong}, "status")
