@@ -19,6 +19,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -59,20 +60,22 @@ const (
 
 // sshFixture is the SSH engine fixture that every scenario deploys through.
 type sshFixture struct {
-	name       string // Every engine resource the test creates starts with it.
-	dir        string
-	binary     string
-	container  string
-	sample     string // The image the sample services run.
-	agent      string // The socket of the private agent holding the client key.
-	address    string
-	knownHosts string
+	name            string // Every engine resource the test creates starts with it.
+	dir             string
+	binary          string
+	container       string
+	sample          string // The image the sample services run.
+	agent           string // The socket of the private agent holding the client key.
+	address         string
+	mismatchAddress string
+	knownHosts      string
 }
 
 // TestE2E builds nastools and the SSH engine fixture, then runs each scenario
 // against the fixture with its own project, lock, and Service IDs.
 func TestE2E(t *testing.T) {
 	t.Parallel()
+	t.Run("command-errors", testE2ECommandErrors)
 	f := startFixture(t)
 	t.Run("deploy", func(t *testing.T) {
 		t.Parallel()
@@ -85,6 +88,19 @@ func TestE2E(t *testing.T) {
 	t.Run("release", func(t *testing.T) {
 		t.Parallel()
 		testLockRelease(t, f)
+	})
+	t.Run("held-status", func(t *testing.T) {
+		t.Parallel()
+		s := newScenario(t, f, "held-status")
+		command := "/var/lib/nastools/exit-status"
+		mustOutput(t, "docker", "exec", f.container, "sh", "-c",
+			`printf '#!/bin/sh\nexit 75\n' > "$1"; chmod 755 "$1"`, "sh", command)
+		_, err := output(t.Context(), "docker", "exec", "--user", fixtureUser,
+			f.container, "flock", "-n", s.lock(), command)
+		var exit *process.ExitError
+		require.ErrorAs(t, err, &exit)
+		assert.Equal(t, lockBusy, exit.ExitCode())
+		assert.Equal(t, []string{"acquired", "released"}, s.lockLog(t))
 	})
 	t.Run("mismatch", func(t *testing.T) {
 		t.Parallel()
@@ -137,7 +153,12 @@ func testLockContention(t *testing.T, f *sshFixture) {
 	waiting := s.start(t, options{delay: holdDelay}, "deploy", "--lock-wait", "2m")
 	held, waited := first.wait(t), waiting.wait(t)
 	require.Equal(t, exitOK, held.code, "%s", held)
-	assert.Regexp(t, `^(busy )+released (busy )*acquired released$`, strings.Join(s.lockLog(t)[before:], " "),
+	var events []string
+	waitFor(t, "the waiting deploy to release its lock", func() bool {
+		events = s.lockLog(t)[before:]
+		return slices.Contains(events, "acquired") && len(events) > 0 && events[len(events)-1] == "released"
+	})
+	assert.Regexp(t, `^(busy )+released (busy )*acquired released$`, strings.Join(events, " "),
 		"the waiting deploy didn't find the lock busy and take it after the first deploy released it")
 	require.Equal(t, exitOK, waited.code, "%s", waited)
 }
@@ -158,19 +179,36 @@ func testLockRelease(t *testing.T, f *sshFixture) {
 	s.requireHealthy(t)
 }
 
-// testHostKeyMismatch connects with a known-hosts entry for another key. The
-// SSH server logs the user of every authentication attempt, and the user
-// name of this run never appears in its log, which shows the run stopped
-// before authentication. A second run with the right key and an unknown
-// user follows, and its log line proves the log already covers the first.
+// testHostKeyMismatch uses a dedicated SSH listener for the mismatch run.
+// Its connection and pre-authentication close lines share a source address
+// and port, so neither parallel scenarios nor the control can supply them.
+// The control still proves that authentication attempts log their user.
 func testHostKeyMismatch(t *testing.T, f *sshFixture) {
 	t.Helper()
 	s := newScenario(t, f, "mismatch")
 	mismatch, control := "mismatch-"+randomSuffix(), "control-"+randomSuffix()
+	const mismatchLog = "/var/lib/nastools/mismatch.log"
+	mustOutput(t, "docker", "exec", f.container, "/usr/sbin/sshd", "-p", "2222", "-E", mismatchLog)
+	waitFor(t, "the mismatch listener to start", func() bool {
+		log := mustOutput(t, "docker", "exec", f.container, "cat", mismatchLog)
+		return strings.Contains(log, "Server listening on")
+	})
+	s.address = f.mismatchAddress
 	wrong := knownhosts.Line([]string{s.address}, publicKey(t, newKey(t)))
 	r := s.run(t, options{user: mismatch, knownHosts: wrong}, "status")
 	assert.Equal(t, exitError, r.code, "%s", r)
 	assert.Contains(t, r.stderr, "SSH transport")
+	var rejected string
+	waitFor(t, "sshd to log the mismatch connection closing before authentication", func() bool {
+		rejected = mustOutput(t, "docker", "exec", f.container, "cat", mismatchLog)
+		return strings.Contains(rejected, " [preauth]")
+	})
+	connection := regexp.MustCompile(`(?m)^Connection from (\S+ port \d+) on .* port 2222`)
+	connections := connection.FindAllStringSubmatch(rejected, -1)
+	require.Len(t, connections, 1, "the dedicated listener must see exactly the mismatch connection")
+	assert.Contains(t, rejected, "Connection closed by "+connections[0][1]+" [preauth]")
+	assert.NotContains(t, rejected, mismatch)
+	s.address = f.address
 	r = s.run(t, options{user: control}, "status")
 	assert.Equal(t, exitError, r.code, "%s", r)
 	var log string
@@ -183,7 +221,7 @@ func testHostKeyMismatch(t *testing.T, f *sshFixture) {
 
 func startFixture(t *testing.T) *sshFixture {
 	t.Helper()
-	dockerContext := requireLocalEngine(t)
+	dockerContext, socket := requireLocalEngine(t)
 	version, err := output(t.Context(), "docker", "version", "--format", "{{.Server.Version}}")
 	if err != nil {
 		noEngine(t, err)
@@ -199,13 +237,19 @@ func startFixture(t *testing.T) *sshFixture {
 	fixtureDir := filepath.Join("..", "..", "testdata", "fixture")
 	build(f.container, fixtureDir)
 	removeLater(t, "image", "rm", f.container)
+	if _, socketErr := output(t.Context(), "docker", "run", "--rm", "--mount",
+		"type=bind,source="+socket+",target=/var/run/docker.sock", f.container,
+		"test", "-S", "/var/run/docker.sock"); socketErr != nil {
+		notLocal(t, "the Docker daemon can't see the effective engine socket path")
+	}
 	build(f.sample, filepath.Join(fixtureDir, "sample"))
 	removeLater(t, "image", "rm", f.sample)
 
 	clientKey, hostKey := newKey(t), newKey(t)
 	f.agent = serveAgent(t, f.dir, clientKey)
 	mustOutput(t, "docker", "create", "--name", f.container, "--publish", "127.0.0.1::22",
-		"--volume", "/var/run/docker.sock:/var/run/docker.sock", f.container)
+		"--publish", "127.0.0.1::2222",
+		"--mount", "type=bind,source="+socket+",target=/var/run/docker.sock", f.container)
 	removeLater(t, "rm", "--force", f.container)
 	hostKeyFile, clientKeyFile := filepath.Join(f.dir, "host_key"), filepath.Join(f.dir, "client_key.pub")
 	require.NoError(t, os.WriteFile(hostKeyFile, pem.EncodeToMemory(privateKey(t, hostKey)), 0o600))
@@ -215,6 +259,8 @@ func startFixture(t *testing.T) *sshFixture {
 	mustOutput(t, "docker", "start", f.container)
 	port := mustOutput(t, "docker", "port", f.container, "22/tcp")
 	f.address, _, _ = strings.Cut(strings.TrimSpace(port), "\n")
+	port = mustOutput(t, "docker", "port", f.container, "2222/tcp")
+	f.mismatchAddress, _, _ = strings.Cut(strings.TrimSpace(port), "\n")
 	f.knownHosts = knownhosts.Line([]string{f.address}, publicKey(t, hostKey))
 	waitFor(t, "sshd to answer", func() bool { return sshAnswers(t.Context(), f.address) })
 	return f
@@ -222,24 +268,27 @@ func startFixture(t *testing.T) *sshFixture {
 
 // requireLocalEngine ends the test unless the Docker command-line tool
 // reaches an engine on this machine through a Unix socket, and returns the
-// name of the active context. The fixture gets full control of the engine it
-// runs on, so it never runs on a remote one. It reads only the environment
+// builder name and socket path of the effective endpoint. The fixture gets
+// full control of the engine it runs on, so it never runs on a remote one. It reads only the environment
 // and the Docker configuration, and doesn't contact an engine.
-func requireLocalEngine(t *testing.T) string {
+func requireLocalEngine(t *testing.T) (string, string) {
 	t.Helper()
-	if host := os.Getenv("DOCKER_HOST"); host != "" && !strings.HasPrefix(host, "unix://") {
-		notLocal(t, "DOCKER_HOST isn't a unix:// socket")
-	}
+
 	active, err := output(t.Context(), "docker", "context", "inspect", "--format",
 		"{{.Name}} {{.Endpoints.docker.Host}}")
 	if err != nil {
 		noEngine(t, err)
 	}
 	name, endpoint, _ := strings.Cut(strings.TrimSpace(active), " ")
-	if !strings.HasPrefix(endpoint, "unix://") {
-		notLocal(t, "the active Docker context isn't a unix:// socket")
+	// DOCKER_CONTEXT takes precedence over DOCKER_HOST. Without an explicit
+	// context, the default Docker builder follows the DOCKER_HOST override.
+	if os.Getenv("DOCKER_CONTEXT") == "" && os.Getenv("DOCKER_HOST") != "" {
+		name, endpoint = "default", os.Getenv("DOCKER_HOST")
 	}
-	return name
+	if !strings.HasPrefix(endpoint, "unix://") {
+		notLocal(t, "the effective Docker endpoint isn't a unix:// socket")
+	}
+	return name, strings.TrimPrefix(endpoint, "unix://")
 }
 
 // requireLocalBuilder ends the test unless the builder named after the active
@@ -322,6 +371,7 @@ type scenario struct {
 	*sshFixture
 
 	project string
+	address string
 	dir     string
 	tmp     string // TMPDIR for nastools, short enough for its socket path.
 	commit  string
@@ -330,7 +380,9 @@ type scenario struct {
 func newScenario(t *testing.T, f *sshFixture, name string) *scenario {
 	t.Helper()
 	dir := t.TempDir()
-	s := &scenario{sshFixture: f, project: f.name + "-" + name, dir: dir, tmp: filepath.Join(f.dir, name)}
+	s := &scenario{
+		sshFixture: f, project: f.name + "-" + name, address: f.address, dir: dir, tmp: filepath.Join(f.dir, name),
+	}
 	require.NoError(t, os.Mkdir(s.tmp, 0o700))
 	removeLater(t, "compose", "--project-name", s.project, "down", "--volumes", "--remove-orphans", "--timeout", "1")
 	root, err := os.OpenRoot(dir)
@@ -612,7 +664,7 @@ func combined(ctx context.Context, env []string, name string, args ...string) (s
 	cmd.Env = env
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return string(out), fmt.Errorf("%s %s: %w\n%s", name, strings.Join(args, " "), err, out)
+		return "", commandError(name, err)
 	}
 	return string(out), nil
 }
@@ -625,7 +677,50 @@ func output(ctx context.Context, name string, args ...string) (string, error) {
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return string(out), fmt.Errorf("%s %s: %w\n%s", name, strings.Join(args, " "), err, stderr.Bytes())
+		return "", commandError(name, err)
 	}
 	return string(out), nil
+}
+
+// fixtureCommandError preserves the exit error for callers without exposing command
+// arguments or standard error, which may contain the engine configuration.
+type fixtureCommandError struct {
+	name string
+	err  error
+}
+
+func (e fixtureCommandError) Error() string {
+	status := -1
+	if exit, ok := errors.AsType[*process.ExitError](e.err); ok {
+		status = exit.ExitCode()
+	}
+	return fmt.Sprintf("%s: exit status %d: command failed (output omitted)", e.name, status)
+}
+
+func (e fixtureCommandError) Unwrap() error { return e.err }
+
+func commandError(name string, err error) error {
+	return fixtureCommandError{name: filepath.Base(name), err: err}
+}
+
+func testE2ECommandErrors(t *testing.T) {
+	t.Helper()
+	for _, helper := range []string{"output", "combined"} {
+		t.Run(helper, func(t *testing.T) {
+			t.Parallel()
+			args := []string{"-c", "printf '%s\\n' 'private-stderr unix:///private/engine.sock runner' >&2; exit 42"}
+			var out string
+			var err error
+			if helper == "output" {
+				out, err = output(t.Context(), "sh", args...)
+			} else {
+				out, err = combined(t.Context(), nil, "sh", args...)
+			}
+			require.EqualError(t, err, "sh: exit status 42: command failed (output omitted)")
+			assert.Empty(t, out)
+			var exit *process.ExitError
+			require.ErrorAs(t, err, &exit)
+			assert.Equal(t, 42, exit.ExitCode())
+		})
+	}
 }

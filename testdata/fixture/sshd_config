@@ -10,4 +10,4 @@ AllowTcpForwarding no
 AllowStreamLocalForwarding no
 X11Forwarding no
 PermitTTY no
-LogLevel INFO
+LogLevel VERBOSE

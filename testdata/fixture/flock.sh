@@ -10,7 +10,8 @@ set -eu
 
 log=/var/lib/nastools/flock.log
 
-if [ "$#" -eq 3 ] && [ "$1" = --held ]; then
+if [ "$#" -eq 4 ] && [ "$1" = --held ]; then
+  touch "$4/acquired"
   echo "acquired $2" >>"$log"
   status=0
   "$3" || status=$?
@@ -22,11 +23,14 @@ if [ "$#" -ne 3 ] || [ "$1" != -n ]; then
   exec /usr/bin/flock "$@"
 fi
 
-# A refusal exits 75 here, apart from any status of the command, and 1 to
-# the caller, as flock itself would.
+# The held wrapper creates a private marker before running the command.
+# Without that marker, status 75 is a refusal, returned as 1 to the caller,
+# as flock itself would. A held command can return any status, including 75.
+marker=$(mktemp -d "${TMPDIR:-/tmp}/nastools-flock.XXXXXX")
+trap 'if [ -e "$marker/acquired" ]; then rm "$marker/acquired"; fi; rmdir "$marker"' EXIT
 status=0
-/usr/bin/flock -n -E 75 "$2" /usr/local/bin/flock --held "$2" "$3" || status=$?
-if [ "$status" -eq 75 ]; then
+/usr/bin/flock -n -E 75 "$2" /usr/local/bin/flock --held "$2" "$3" "$marker" || status=$?
+if [ "$status" -eq 75 ] && [ ! -e "$marker/acquired" ]; then
   echo "busy $2" >>"$log"
   exit 1
 fi
