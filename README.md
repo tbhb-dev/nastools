@@ -101,7 +101,7 @@ Before deployment use, network-attached storage qualification must verify host k
 
 ## Remote engine
 
-nastools runs Compose on the machine that runs nastools and points it at the device's engine through `DOCKER_HOST`. Each source in a Compose model comes either from that local machine or from the device, and Compose uses it at one fixed step, which the table names. These rows follow the Compose v5.6.1 source. Naming that release doesn't make it the oldest one nastools supports.
+nastools runs Compose on the machine that runs nastools and points it at the device's engine through `DOCKER_HOST`. Each source in a Compose model comes either from that local machine or from the device, and Compose uses it at one fixed step, which the table names. These rows follow the Compose v5.6.1 source. Naming that release doesn't make it the oldest one nastools supports. Testing covers these routes from Compose 2.23.1 onward, and nastools refuses an older release before it connects.
 
 | Source | Content comes from | Compose uses it |
 | --- | --- | --- |

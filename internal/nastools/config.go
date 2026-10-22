@@ -19,7 +19,6 @@ import (
 	"regexp"
 	"slices"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
@@ -308,9 +307,7 @@ func Execute(ctx context.Context, ops Operations, path string, env map[string]st
 	if command.LockWait < 0 || command.Tail < 0 {
 		return ErrInvalid
 	}
-	if command.Name == Deploy || command.Name == CheckName {
-		err = compose(ctx, ops, inputs, []string{"config", "-q"}, nil, nil)
-	}
+	err = command.local(ctx, ops, inputs)
 	if err != nil || command.Name == CheckName {
 		return err
 	}
@@ -326,19 +323,25 @@ func Execute(ctx context.Context, ops Operations, path string, env map[string]st
 			return err
 		}
 	}
-	inputs.Env = append(slices.DeleteFunc(inputs.Env, func(entry string) bool {
-		name, _, _ := strings.Cut(entry, "=")
-		return slices.Contains(
-			[]string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"},
-			name,
-		)
-	}), "DOCKER_HOST=unix://"+socket)
+	inputs.Env = append(withoutEngine(inputs.Env), "DOCKER_HOST=unix://"+socket)
 	for _, args := range command.arguments(inputs.Config.WaitSeconds) {
 		if err = compose(ctx, ops, inputs, args, out, errOut); err != nil {
 			return err
 		}
 	}
 	return command.report(ctx, ops, inputs, out, errOut)
+}
+
+// local runs the Compose calls that don't need the transport: the version
+// probe, then the config check for deploy and check.
+func (command Command) local(ctx context.Context, ops Operations, inputs Inputs) error {
+	if err := checkCompose(ctx, ops, inputs.Env); err != nil {
+		return err
+	}
+	if command.Name != Deploy && command.Name != CheckName {
+		return nil
+	}
+	return compose(ctx, ops, inputs, []string{"config", "-q"}, nil, nil)
 }
 
 // report runs after Compose has succeeded. A Serve failure leaves the stack up.

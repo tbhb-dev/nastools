@@ -45,6 +45,28 @@ target = "http://127.0.0.1:3000"
 // relativeLockDir is private only to the fixture whose config names it.
 const relativeLockDir = "secret-9.example.invalid/locks"
 
+// probeSecrets lists values that are private only to the fixtures that
+// require their variables. Each has a byte that an echo could escape, trim,
+// or cut, and its fragments are the parts that such an echo would leave
+// readable.
+func probeSecrets() []probeSecret {
+	return []probeSecret{
+		{"quote", "QUOTED_INPUT", `quoted-head"quoted-tail.example.invalid`, []string{"quoted-head", "quoted-tail"}},
+		{"backslash", "SLASHED_INPUT", `slashed-head\slashed-tail.example.invalid`, []string{
+			"slashed-head", "slashed-tail",
+		}},
+		{"whitespace", "SPACED_INPUT", "\tspaced-secret.example.invalid ", []string{"spaced-secret"}},
+		{"long", "LONG_INPUT", "long-secret-head.example.invalid/long-secret-tail", []string{
+			"long-secret-head", "long-secret-tail",
+		}},
+	}
+}
+
+type probeSecret struct {
+	name, env, value string
+	fragments        []string
+}
+
 // canaries lists every private value of the fixture, in the forms that
 // nastools output could contain.
 func canaries() []string {
@@ -56,7 +78,7 @@ func canaries() []string {
 }
 
 func matrixEnv() map[string]string {
-	return map[string]string{
+	env := map[string]string{
 		"GITHUB_ACTIONS":           "true",
 		"NASTOOLS_PRIVATE_STRINGS": "secret-6.example.invalid",
 		"REQUIRED_INPUT":           "secret-1.example.invalid",
@@ -68,6 +90,10 @@ func matrixEnv() map[string]string {
 		"RELATIVE_LOCK_DIR": relativeLockDir,
 		"TEMPLATE_INPUT":    "secret-5.example.invalid",
 	}
+	for _, secret := range probeSecrets() {
+		env[secret.env] = secret.value
+	}
+	return env
 }
 
 func matrixFake() *nastoolstest.Fake {
@@ -138,6 +164,17 @@ func fixtures() []fixture {
 			"secret-7.example.invalid",
 		}, false},
 		{"git", func(f *nastoolstest.Fake) { f.GitErr = nastoolstest.ErrPrivate }, nil, false},
+		{"compose version probe", func(f *nastoolstest.Fake) { f.VersionErr = nastoolstest.ErrPrivate }, nil, false},
+		{"compose too old", func(f *nastoolstest.Fake) { f.ComposeVersion = []byte("2.23.0\n") }, nil, false},
+		{"compose version with canary", func(f *nastoolstest.Fake) {
+			f.ComposeVersion = []byte("2.23.0-secret-1.example.invalid\n")
+		}, nil, false},
+		{"compose version only canary", func(f *nastoolstest.Fake) {
+			f.ComposeVersion = []byte("secret-1.example.invalid\n")
+		}, nil, false},
+		{"compose version quoted canary", func(f *nastoolstest.Fake) {
+			f.ComposeVersion = []byte(`"secret-1.example.invalid"` + "\n")
+		}, nil, false},
 		{"compose config", func(f *nastoolstest.Fake) { f.FailCommand = "config" }, nil, false},
 		{"compose pull", func(f *nastoolstest.Fake) { f.FailCommand = "pull" }, nil, false},
 		{"compose up", func(f *nastoolstest.Fake) { f.FailCommand = "up" }, nil, false},
@@ -151,7 +188,38 @@ func fixtures() []fixture {
 		{"bad status JSON", func(f *nastoolstest.Fake) {
 			f.RemoteStatus = "not json " + strings.Join(canaries(), " ")
 		}, nil, false},
-	}, inputFixtures()...)
+	}, slices.Concat(probeFixtures(), inputFixtures())...)
+}
+
+// probeFixtures requires each probe secret and puts it in the version
+// probe's output, alone or after a release below the floor.
+func probeFixtures() []fixture {
+	result := make([]fixture, 0, 2*len(probeSecrets()))
+	for _, secret := range probeSecrets() {
+		for _, layout := range []struct{ name, prefix string }{{"alone", ""}, {"after old release", "2.23.0-"}} {
+			result = append(result, fixture{
+				"compose version " + secret.name + " secret " + layout.name,
+				func(f *nastoolstest.Fake) {
+					f.Files["nastools.toml"] = strings.Replace(f.Files["nastools.toml"], `["REQUIRED_INPUT"]`,
+						`["REQUIRED_INPUT", "`+secret.env+`"]`, 1)
+					f.ComposeVersion = []byte(layout.prefix + secret.value + "\n")
+					f.Canaries = append(f.Canaries, secret.value)
+				}, nil, false,
+			})
+		}
+	}
+	return result
+}
+
+// fragments lists the readable parts of the probe secrets among values.
+func fragments(values []string) []string {
+	var result []string
+	for _, secret := range probeSecrets() {
+		if slices.Contains(values, secret.value) {
+			result = append(result, secret.fragments...)
+		}
+	}
+	return result
 }
 
 // inputFixtures puts the required input and the three SSH inputs in every
@@ -316,9 +384,9 @@ func TestRunNeverPrintsPrivateValues(t *testing.T) {
 			}
 			// nastools can't know a value whose only source it can't read, so
 			// it may echo that value from its arguments.
-			private := append(slices.DeleteFunc(canaries(), func(value string) bool {
+			private := slices.Concat(slices.DeleteFunc(canaries(), func(value string) bool {
 				return slices.Contains(tc.fixture.unmasked, value) && slices.Contains(tc.args, value)
-			}), added...)
+			}), added, fragments(added))
 			assertGated(t, out, errOut.String(), masks, private)
 			if out.maskFailed {
 				assert.NotEqual(t, exitOK, code)
@@ -459,18 +527,20 @@ func TestMaskFailureStopsBeforeExecuting(t *testing.T) {
 }
 
 // stderrOnly writes the host name to standard error alone, so after
-// discovery only its mask command goes to standard output.
+// discovery only its mask command goes to standard output. A call without
+// standard error, such as the version probe, keeps its standard output.
 type stderrOnly struct {
 	*nastoolstest.Fake
 }
 
-func (s stderrOnly) Compose(ctx context.Context, args, env []string, _, errOut io.Writer) error {
+func (s stderrOnly) Compose(ctx context.Context, args, env []string, out, errOut io.Writer) error {
 	if errOut != nil {
 		if _, err := io.WriteString(errOut, tailnetName+"\n"); err != nil {
 			return fmt.Errorf("compose: %w", err)
 		}
+		out = nil
 	}
-	if err := s.Fake.Compose(ctx, args, env, nil, nil); err != nil {
+	if err := s.Fake.Compose(ctx, args, env, out, nil); err != nil {
 		return fmt.Errorf("compose: %w", err)
 	}
 	return nil

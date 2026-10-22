@@ -43,6 +43,13 @@ type Fake struct {
 	LockBlock    bool
 	OnPause      func()
 	Canaries     []string
+	// The Compose version probe skips the recording fields, ComposeErr and
+	// FailCommand. It writes ComposeVersion verbatim, or a supported release
+	// when that's nil. VersionErr fails it, and VersionEnv records its
+	// environment.
+	ComposeVersion []byte
+	VersionErr     error
+	VersionEnv     []string
 
 	Calls        []string
 	Opened       []string
@@ -141,6 +148,9 @@ func (f *Fake) GitState(context.Context, string) (nastools.GitState, error) {
 }
 
 func (f *Fake) Compose(_ context.Context, args, env []string, out, errOut io.Writer) error {
+	if slices.Equal(args, []string{"version", "--short"}) {
+		return f.version(env, out)
+	}
 	f.Calls = append(f.Calls, "compose")
 	f.Args, f.Env = slices.Clone(args), slices.Clone(env)
 	f.Commands = append(f.Commands, slices.Clone(args))
@@ -160,6 +170,19 @@ func (f *Fake) Compose(_ context.Context, args, env []string, out, errOut io.Wri
 		return f.fail(ErrPrivate)
 	}
 	return f.fail(f.ComposeErr)
+}
+
+// version answers the Compose version probe apart from the other calls.
+func (f *Fake) version(env []string, out io.Writer) error {
+	f.VersionEnv = slices.Clone(env)
+	answer := f.ComposeVersion
+	if answer == nil {
+		answer = []byte("5.6.1\n")
+	}
+	if _, err := out.Write(answer); err != nil {
+		return f.fail(ErrPrivate)
+	}
+	return f.fail(f.VersionErr)
 }
 
 // Remote records one remote command, writing the canned Serve status for a
