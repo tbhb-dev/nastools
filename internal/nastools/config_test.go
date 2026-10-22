@@ -4,6 +4,7 @@
 package nastools_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -71,6 +72,19 @@ func TestServePolicy(t *testing.T) {
 		{"tcp maximum port", nastools.Endpoint{Service: "svc:example", TCP: 65535, Target: "tcp://example.invalid:4317"}, true},
 		{"https port overflow", nastools.Endpoint{Service: "svc:example", HTTPS: 65536, Target: "https://example.invalid"}, false},
 		{"tcp port overflow", nastools.Endpoint{Service: "svc:example", TCP: 65536, Target: "tcp://example.invalid:4317"}, false},
+		{"service label", nastools.Endpoint{Service: "svc:a", HTTPS: 443, Target: "http://example.invalid"}, true},
+		{"service hyphen", nastools.Endpoint{Service: "svc:a-1-b", HTTPS: 443, Target: "http://example.invalid"}, true},
+		{"service uppercase", nastools.Endpoint{Service: "svc:Example", HTTPS: 443, Target: "http://example.invalid"}, false},
+		{"service leading hyphen", nastools.Endpoint{Service: "svc:-example", HTTPS: 443, Target: "http://example.invalid"}, false},
+		{"service trailing hyphen", nastools.Endpoint{Service: "svc:example-", HTTPS: 443, Target: "http://example.invalid"}, false},
+		{"service underscore", nastools.Endpoint{Service: "svc:ex_ample", HTTPS: 443, Target: "http://example.invalid"}, false},
+		{"service dot", nastools.Endpoint{Service: "svc:example.invalid", HTTPS: 443, Target: "http://example.invalid"}, false},
+		{"service too long", nastools.Endpoint{Service: "svc:" + strings.Repeat("a", 64), HTTPS: 443, Target: "http://example.invalid"}, false},
+		{"https target port", nastools.Endpoint{Service: "svc:example", HTTPS: 443, Target: "http://example.invalid:65535"}, true},
+		{"https target port zero", nastools.Endpoint{Service: "svc:example", HTTPS: 443, Target: "http://example.invalid:0"}, false},
+		{"https target port overflow", nastools.Endpoint{Service: "svc:example", HTTPS: 443, Target: "http://example.invalid:65536"}, false},
+		{"tcp target port zero", nastools.Endpoint{Service: "svc:example", TCP: 4317, Target: "tcp://example.invalid:0"}, false},
+		{"tcp target port overflow", nastools.Endpoint{Service: "svc:example", TCP: 4317, Target: "tcp://example.invalid:65536"}, false},
 		{"empty service name", nastools.Endpoint{Service: "svc:", HTTPS: 443, Target: "http://example.invalid"}, false},
 		{"bad service", nastools.Endpoint{Service: "example", HTTPS: 443, Target: "http://example.invalid"}, false},
 		{"both ports", nastools.Endpoint{Service: "svc:example", HTTPS: 443, TCP: 4317, Target: "http://example.invalid"}, false},

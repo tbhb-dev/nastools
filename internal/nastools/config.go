@@ -98,9 +98,17 @@ func (c Config) validate() error {
 	return nil
 }
 
+const maxPort = 65535
+
+var serviceID = regexp.MustCompile(`^svc:[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+func validPort(port string) bool {
+	number, err := strconv.Atoi(port)
+	return err == nil && number >= 1 && number <= maxPort
+}
+
 func (e Endpoint) valid() bool {
-	const maxPort = 65535
-	if !strings.HasPrefix(e.Service, "svc:") || e.Service == "svc:" ||
+	if !serviceID.MatchString(e.Service) ||
 		(e.HTTPS > 0) == (e.TCP > 0) || e.HTTPS < 0 || e.TCP < 0 || e.HTTPS > maxPort || e.TCP > maxPort {
 		return false
 	}
@@ -109,9 +117,9 @@ func (e Endpoint) valid() bool {
 		return false
 	}
 	if e.TCP > 0 {
-		return u.Scheme == "tcp" && u.Port() != ""
+		return u.Scheme == "tcp" && validPort(u.Port())
 	}
-	return u.Scheme == "http" || u.Scheme == "https"
+	return (u.Scheme == "http" || u.Scheme == "https") && (u.Port() == "" || validPort(u.Port()))
 }
 
 func resolve(dir, path string) string {
@@ -360,14 +368,14 @@ func (command Command) report(ctx context.Context, ops Operations, inputs Inputs
 // publish applies each declared endpoint. Re-running a Serve command with the
 // same flags is idempotent, and the flags scope each command to one Service ID.
 func publish(ctx context.Context, ops Operations, endpoints []Endpoint, out, errOut io.Writer) error {
-	for _, e := range endpoints {
+	for i, e := range endpoints {
 		port := "--https=" + strconv.Itoa(e.HTTPS)
 		if e.TCP > 0 {
 			port = "--tcp=" + strconv.Itoa(e.TCP)
 		}
 		argv := []string{"tailscale", "serve", "--service=" + e.Service, port, e.Target}
 		if ops.Remote(ctx, argv, out, errOut) != nil {
-			return fmt.Errorf("serve: %w", ErrInvalid)
+			return fmt.Errorf("serve[%d]: %w", i, ErrInvalid)
 		}
 	}
 	return nil
@@ -420,7 +428,16 @@ func (command Command) arguments(wait int) [][]string {
 	return nil
 }
 
+// busy reports contention, unless the parent context ended the wait.
+func busy(parent context.Context) error {
+	if parent.Err() != nil {
+		return fmt.Errorf("deploy lock: %w", ErrInvalid)
+	}
+	return fmt.Errorf("%w: %w", ErrBusy, ErrInvalid)
+}
+
 func acquire(ctx context.Context, ops Operations, path string, wait time.Duration) error {
+	parent := ctx
 	if wait > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, wait)
@@ -431,11 +448,16 @@ func acquire(ctx context.Context, ops Operations, path string, wait time.Duratio
 		if err == nil {
 			return nil
 		}
-		if !errors.Is(err, ErrBusy) {
+		// A wait that expires mid-attempt may fail the transport, yet the lock was still busy.
+		expired := parent.Err() == nil && errors.Is(ctx.Err(), context.DeadlineExceeded)
+		if !expired && !errors.Is(err, ErrBusy) {
 			return fmt.Errorf("deploy lock: %w", ErrInvalid)
 		}
-		if wait == 0 || ops.Pause(ctx) != nil {
+		if expired || wait == 0 {
 			return fmt.Errorf("%w: %w", ErrBusy, ErrInvalid)
+		}
+		if ops.Pause(ctx) != nil {
+			return busy(parent)
 		}
 	}
 }
