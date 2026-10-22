@@ -80,7 +80,7 @@ func TestInactivePassesThrough(t *testing.T) {
 	t.Parallel()
 	var out, errOut bytes.Buffer
 	g := redact.New(&out, &errOut, false, redact.TailnetName)
-	g.Add(secret)
+	g.Register(redact.Set{Values: []string{secret}})
 	assert.Same(t, &out, g.Stdout())
 	assert.Same(t, &errOut, g.Stderr())
 	_, err := io.WriteString(g.Stdout(), secret+" "+tailnet)
@@ -93,8 +93,10 @@ func TestInactivePassesThrough(t *testing.T) {
 func TestMasksAndRedactsDerivedForms(t *testing.T) {
 	t.Parallel()
 	g, log := gate(0)
-	g.Add(secret, "", "  ", secret, "%\r%")
-	g.AddHosts("secret-2.example.invalid:22", knownHosts)
+	g.Register(redact.Set{
+		Values: []string{secret, "", "  ", secret, "%\r%"},
+		Hosts:  []string{"secret-2.example.invalid:22", knownHosts},
+	})
 	_, err := io.WriteString(
 		g.Stderr(),
 		"a secret-1.example.invalid b\nsecret-2.example.invalid secret-4.example.invalid",
@@ -115,6 +117,98 @@ func TestMasksAndRedactsDerivedForms(t *testing.T) {
 		maskPrefix+"secret-5.example.invalid\n"+
 		"c ***\npartial", text(*log, "out"))
 	assert.Equal(t, "a *** b\n*** ***", text(*log, "err"))
+}
+
+// TestRegisterOrderIndependent checks that the masks and the redacted
+// output depend only on which values arrive in which group. The result
+// stays the same for each order of the inputs, for each split of that order
+// into calls, and when the calls run twice. The address and a known-hosts
+// line also arrive as plain values, as when a config requires them.
+func TestRegisterOrderIndependent(t *testing.T) {
+	t.Parallel()
+	inputs := []input{
+		{secret, false},
+		{"secret-2.example.invalid:22", false},
+		{"secret-2.example.invalid:22", true},
+		{knownHosts, true},
+		{strings.Split(knownHosts, "\n")[0], false},
+	}
+	wantMasks, wantRedacted := registerCalls(t, [][]input{inputs})
+	assert.Equal(t, "a *** *** ***\n*** *** ***\n", wantRedacted)
+	for _, order := range permutations(inputs) {
+		for _, calls := range splits(order) {
+			for _, repeated := range [][][]input{calls, slices.Concat(calls, calls)} {
+				masks, redacted := registerCalls(t, repeated)
+				if !assert.Equal(t, wantMasks, masks, "%v", repeated) ||
+					!assert.Equal(t, wantRedacted, redacted, "%v", repeated) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// input is one value to register, as an address or known-hosts value when
+// host is set.
+type input struct {
+	value string
+	host  bool
+}
+
+// registerCalls registers each call's inputs together, then redacts a line
+// of every form. It returns the sorted masks and the redacted text.
+func registerCalls(t *testing.T, calls [][]input) ([]string, string) {
+	t.Helper()
+	g, log := gate(0)
+	for _, call := range calls {
+		var set redact.Set
+		for _, in := range call {
+			if in.host {
+				set.Hosts = append(set.Hosts, in.value)
+			} else {
+				set.Values = append(set.Values, in.value)
+			}
+		}
+		g.Register(set)
+	}
+	_, err := io.WriteString(g.Stderr(), "a "+secret+" secret-2.example.invalid:22 secret-2.example.invalid\n"+
+		"secret-4.example.invalid secret-5.example.invalid "+tailnet+"\n")
+	require.NoError(t, err)
+	require.NoError(t, g.Close())
+	masks := strings.Split(text(*log, "out"), "\n")
+	slices.Sort(masks)
+	return masks, text(*log, "err")
+}
+
+// splits lists every way to cut items into consecutive calls.
+func splits[T any](items []T) [][][]T {
+	result := make([][][]T, 0, 1<<(len(items)-1))
+	for cuts := range cap(result) {
+		var calls [][]T
+		first := 0
+		for i := 1; i <= len(items); i++ {
+			if i == len(items) || cuts&(1<<(i-1)) != 0 {
+				calls = append(calls, items[first:i])
+				first = i
+			}
+		}
+		result = append(result, calls)
+	}
+	return result
+}
+
+// permutations lists every order of items.
+func permutations[T any](items []T) [][]T {
+	if len(items) <= 1 {
+		return [][]T{items}
+	}
+	var result [][]T
+	for i := range items {
+		for _, rest := range permutations(slices.Concat(items[:i], items[i+1:])) {
+			result = append(result, slices.Concat([]T{items[i]}, rest))
+		}
+	}
+	return result
 }
 
 func TestTailnetNameMaskedBeforeItsLine(t *testing.T) {
@@ -142,8 +236,10 @@ func TestTailnetNameMaskedBeforeItsLine(t *testing.T) {
 func TestHostFormsOnlyForHosts(t *testing.T) {
 	t.Parallel()
 	g, log := gate(0)
-	g.Add("services: web", "hostname:8080", "secret-4.example.invalid ssh-ed25519 AAAA")
-	g.AddHosts("secret-2.example.invalid:22")
+	g.Register(redact.Set{
+		Values: []string{"services: web", "hostname:8080", "secret-4.example.invalid ssh-ed25519 AAAA"},
+		Hosts:  []string{"secret-2.example.invalid:22"},
+	})
 	_, err := io.WriteString(g.Stderr(), "services hostname secret-4.example.invalid secret-2.example.invalid\n")
 	require.NoError(t, err)
 	require.NoError(t, g.Close())
@@ -154,7 +250,7 @@ func TestReplacementCannotExposeAName(t *testing.T) {
 	t.Parallel()
 	g, log := gate(0)
 	// The value and the name overlap, so neither may leave part of the other.
-	g.Add("long-secret-token=abc-node")
+	g.Register(redact.Set{Values: []string{"long-secret-token=abc-node"}})
 	_, err := io.WriteString(g.Stderr(), "long-secret-token=abc-node-2.example.ts.net\n")
 	require.NoError(t, err)
 	require.NoError(t, g.Close())
@@ -164,7 +260,7 @@ func TestReplacementCannotExposeAName(t *testing.T) {
 func TestOverlappingValues(t *testing.T) {
 	t.Parallel()
 	g, log := gate(0)
-	g.Add("overlap", "lapping", "ping-pong")
+	g.Register(redact.Set{Values: []string{"overlap", "lapping", "ping-pong"}})
 	_, err := io.WriteString(g.Stderr(), "an overlapping-pong one, overlap lapping\n")
 	require.NoError(t, err)
 	require.NoError(t, g.Close())
@@ -175,7 +271,9 @@ func TestTrailingNewlineValue(t *testing.T) {
 	t.Parallel()
 	g, log := gate(0)
 	// Only the first two values are multi-line once their blank lines go.
-	g.Add("abc1234\n", "def5678\r\n", "first-line\nx\n", "\npass123", "word456\n \n", " \r\n\tkey789\n\n", "\n \n")
+	g.Register(redact.Set{Values: []string{
+		"abc1234\n", "def5678\r\n", "first-line\nx\n", "\npass123", "word456\n \n", " \r\n\tkey789\n\n", "\n \n",
+	}})
 	_, err := io.WriteString(g.Stderr(), "abc1234 def5678 first-line x pass123 word456 \tkey789\n")
 	require.NoError(t, err)
 	require.NoError(t, g.Close())
@@ -209,7 +307,7 @@ func TestMaskFailureIsSticky(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			g, log := gate(tc.failAt)
-			g.Add(tc.values...)
+			g.Register(redact.Set{Values: tc.values})
 			_, err := io.WriteString(g.Stderr(), "x "+tailnet+" secret-2.example.invalid "+secret+"\n")
 			require.NoError(t, err)
 			require.ErrorIs(t, g.Err(), errBroken)
@@ -284,7 +382,7 @@ func TestLongLineCut(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			g, log := gate(0)
-			g.Add(tc.secrets...)
+			g.Register(redact.Set{Values: tc.secrets})
 			for i, write := range tc.writes {
 				_, err := io.WriteString(g.Stderr(), write)
 				require.NoError(t, err)
@@ -315,7 +413,7 @@ func TestConcurrentStreams(t *testing.T) {
 	t.Parallel()
 	var out, errOut bytes.Buffer
 	g := redact.New(&out, &errOut, true, redact.TailnetName)
-	g.Add(secret)
+	g.Register(redact.Set{Values: []string{secret}})
 	var workers sync.WaitGroup
 	for i := range 8 {
 		workers.Go(func() {
@@ -324,7 +422,7 @@ func TestConcurrentStreams(t *testing.T) {
 				w = g.Stderr()
 			}
 			for j := range 50 {
-				g.Add("added-" + strconv.Itoa(i) + ".example.invalid")
+				g.Register(redact.Set{Values: []string{"added-" + strconv.Itoa(i) + ".example.invalid"}})
 				line := "line " + secret + " node-" + strconv.Itoa(j) + ".example.ts.net\n"
 				_, err := io.WriteString(w, line)
 				assert.NoError(t, err)
@@ -362,7 +460,7 @@ func writeChunks(t *testing.T, w io.Writer, data string, splits []byte) {
 func run(t *testing.T, secrets []string, input string, splits []byte) []entry {
 	t.Helper()
 	g, log := gate(0)
-	g.Add(secrets...)
+	g.Register(redact.Set{Values: secrets})
 	writeChunks(t, g.Stderr(), input, splits)
 	writeChunks(t, g.Stdout(), input, splits)
 	require.NoError(t, g.Close())

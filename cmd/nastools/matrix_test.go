@@ -100,7 +100,7 @@ func fixtures() []fixture {
 			return "project = = 'x'\n" + declaration + "\n" + text
 		})
 	}
-	return []fixture{
+	return append([]fixture{
 		{"valid", func(*nastoolstest.Fake) {}, nil, false},
 		{"syntax error", config(func(text string) string { return "project = = 'x'\n" + text }), nil, true},
 		{"syntax error, dotted", expandOnly(`expand_files.EXPANDED_INPUT = "expanded.txt"`), nil, true},
@@ -133,7 +133,63 @@ func fixtures() []fixture {
 		{"bad status JSON", func(f *nastoolstest.Fake) {
 			f.RemoteStatus = "not json " + strings.Join(canaries(), " ")
 		}, nil, false},
+	}, inputFixtures()...)
+}
+
+// inputFixtures puts the required input and the three SSH inputs in every
+// order in the list of required variables. It adds configs where one SSH
+// key points at the variable of another, with every input in that list
+// forward and reversed. A value then arrives both as a plain value and as
+// an address or known-hosts value, and each order must still yield every
+// host name.
+func inputFixtures() []fixture {
+	declare := func(name string, required []string, ssh ...string) fixture {
+		return fixture{name, func(f *nastoolstest.Fake) {
+			text := strings.Replace(f.Files["nastools.toml"], `["REQUIRED_INPUT"]`,
+				`["`+strings.Join(required, `", "`)+`"]`, 1)
+			f.Files["nastools.toml"] = strings.NewReplacer(ssh...).Replace(text)
+		}, nil, false}
 	}
+	inputs := []string{"REQUIRED_INPUT", "SSH_ADDRESS", "SSH_USER", "SSH_KNOWN_HOSTS"}
+	overlaps := []struct {
+		name string
+		ssh  []string
+	}{
+		{"user is address", []string{`user_env = "SSH_USER"`, `user_env = "SSH_ADDRESS"`}},
+		{"user is known hosts", []string{`user_env = "SSH_USER"`, `user_env = "SSH_KNOWN_HOSTS"`}},
+		{"address and known hosts swapped", []string{
+			`address_env = "SSH_ADDRESS"`, `address_env = "SSH_KNOWN_HOSTS"`,
+			`known_hosts_env = "SSH_KNOWN_HOSTS"`, `known_hosts_env = "SSH_ADDRESS"`,
+		}},
+	}
+	orders := permutations(inputs)
+	result := make([]fixture, 0, len(orders)+2*len(overlaps))
+	for _, order := range orders {
+		result = append(result, declare("required_env "+strings.Join(order, " "), order))
+	}
+	for _, overlap := range overlaps {
+		reversed := slices.Clone(inputs)
+		slices.Reverse(reversed)
+		for _, order := range [][]string{inputs, reversed} {
+			result = append(result, declare(overlap.name+", required_env "+strings.Join(order, " "), order,
+				overlap.ssh...))
+		}
+	}
+	return result
+}
+
+// permutations lists every order of items.
+func permutations(items []string) [][]string {
+	if len(items) <= 1 {
+		return [][]string{items}
+	}
+	var result [][]string
+	for i := range items {
+		for _, rest := range permutations(slices.Concat(items[:i], items[i+1:])) {
+			result = append(result, slices.Concat([]string{items[i]}, rest))
+		}
+	}
+	return result
 }
 
 // faultyWriter fails every write from the numbered one on, and records a

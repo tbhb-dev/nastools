@@ -65,21 +65,24 @@ func New(stdout, stderr io.Writer, active bool, patterns ...*regexp.Regexp) *Gat
 	return g
 }
 
-// Add masks each value at once and redacts it from later output.
-func (g *Gate) Add(values ...string) { g.add(values, false) }
+// Set holds the private values to register.
+type Set struct {
+	Values []string
+	Hosts  []string // Address and known-hosts values, whose host names are private too.
+}
 
-// AddHosts adds address and known-hosts values, with the host names in them.
-func (g *Gate) AddHosts(values ...string) { g.add(values, true) }
-
-func (g *Gate) add(values []string, hosts bool) {
+// Register masks each value in set at once, with every form derived from
+// it, and redacts them all from later output. A value's forms depend only
+// on the value and its group, never on what the gate already contains, so
+// the same values in any order, grouping, or repetition leave the same
+// secrets.
+func (g *Gate) Register(set Set) {
 	if !g.active {
 		return
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	for _, value := range values {
-		g.register(value, false, hosts)
-	}
+	g.register(set)
 }
 
 func (g *Gate) Stdout() io.Writer {
@@ -120,24 +123,49 @@ func (g *Gate) Close() error {
 	return errors.Join(append(errs, g.err)...)
 }
 
-// register adds a value without its blank first and last lines. A value
-// then counts as multi-line only for a newline between two of its lines.
-func (g *Gate) register(value string, derived, hosts bool) {
+// register derives every form of set first and only then skips the forms
+// the gate already contains.
+func (g *Gate) register(set Set) {
+	for _, value := range set.forms() {
+		if g.masked[value] {
+			continue
+		}
+		g.masked[value] = true
+		if !strings.Contains(value, "\n") {
+			g.secrets = append(g.secrets, value)
+		}
+		g.mask(value)
+	}
+	slices.SortFunc(g.secrets, func(a, b string) int {
+		return cmp.Or(cmp.Compare(len(b), len(a)), strings.Compare(a, b))
+	})
+}
+
+// forms lists every value in set, each followed by the forms derived from it.
+func (set Set) forms() []string {
+	all := make([]string, 0, len(set.Values)+len(set.Hosts))
+	for _, value := range set.Values {
+		all = append(all, expand(value, false, false)...)
+	}
+	for _, value := range set.Hosts {
+		all = append(all, expand(value, false, true)...)
+	}
+	return all
+}
+
+// expand returns value without its blank first and last lines, followed by
+// the forms derived from it. A value then counts as multi-line only for a
+// newline between two of its lines.
+func expand(value string, derived, hosts bool) []string {
 	value = trimBlankLines(value)
-	if strings.TrimSpace(value) == "" || g.masked[value] || (derived && len(value) < minDerived) {
-		return
+	if strings.TrimSpace(value) == "" || (derived && len(value) < minDerived) {
+		return nil
 	}
-	g.masked[value] = true
-	if !strings.Contains(value, "\n") {
-		g.secrets = append(g.secrets, value)
-		slices.SortFunc(g.secrets, func(a, b string) int {
-			return cmp.Or(cmp.Compare(len(b), len(a)), strings.Compare(a, b))
-		})
-	}
-	g.mask(value)
+	forms := []string{value}
 	for _, form := range derivedForms(value, hosts) {
-		g.register(form, true, hosts)
+		forms = append(forms, expand(form, true, hosts)...)
 	}
+	return forms
 }
 
 // trimBlankLines drops the whitespace-only lines at either end of value,
@@ -209,8 +237,8 @@ func (g *Gate) redact(line string) string {
 	for {
 		found := false
 		for _, pattern := range g.patterns {
-			for _, match := range pattern.FindAllString(line, -1) {
-				g.register(match, false, false)
+			if matches := pattern.FindAllString(line, -1); len(matches) > 0 {
+				g.register(Set{Values: matches})
 				found = true
 			}
 		}

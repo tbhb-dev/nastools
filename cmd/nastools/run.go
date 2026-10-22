@@ -40,8 +40,7 @@ func Run(ctx context.Context, args []string, s streams, ops nastools.Operations,
 	ops = nastools.Cached(ops)
 	path := configArgument(args)
 	private := nastools.Discover(ops.ReadFile, path, env)
-	gate.Add(private.Values...)
-	gate.AddHosts(private.Hosts...)
+	gate.Register(redact.Set{Values: private.Values, Hosts: private.Hosts})
 	code := exitError
 	if gate.Err() != nil {
 		fmt.Fprintln(gate.Stderr(), "nastools: mask output:", nastools.ErrInvalid)
