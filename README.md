@@ -150,16 +150,17 @@ Each `[files]` value reaches Compose as one environment string, so the system ru
 
 The SSH engine fixture in `testdata/fixture/` is the supported way to rehearse a deploy against a local Docker engine. It's a container image that runs `sshd` with public-key authentication only, for the user `nastools`. That user may run exactly `sudo -n /usr/local/bin/docker system dial-stdio` without a password, and the Docker command-line tool inside reaches the local engine through its mounted socket. Besides `flock` and the lock directory `/var/lib/nastools/locks`, the image provides a `tailscale` stub. It records each `tailscale serve` command in `/var/lib/nastools/serve.log` and answers `tailscale serve status --json` from that log. A rehearsal records Serve entries without applying them.
 
-Keys don't come with the image. Generate a host key and a client key, copy the host key and the client's public key into the container before it starts, and publish `sshd` on `127.0.0.1`:
+Keys don't come with the image. Generate a host key and a client key in a temporary directory, copy the host key and the client's public key into the container before it starts, and publish `sshd` on `127.0.0.1`:
 
 ```sh
-ssh-keygen -q -t ed25519 -N '' -f fixture_host_key
-ssh-keygen -q -t ed25519 -N '' -f fixture_client_key
+keys="$(mktemp -d)"
+ssh-keygen -q -t ed25519 -N '' -f "$keys/fixture_host_key"
+ssh-keygen -q -t ed25519 -N '' -f "$keys/fixture_client_key"
 docker build --tag nastools-fixture testdata/fixture
 docker create --name nastools-fixture --publish 127.0.0.1:2222:22 \
   --volume /var/run/docker.sock:/var/run/docker.sock nastools-fixture
-docker cp fixture_host_key nastools-fixture:/etc/ssh/ssh_host_ed25519_key
-docker cp fixture_client_key.pub nastools-fixture:/home/nastools/.ssh/authorized_keys
+docker cp "$keys/fixture_host_key" nastools-fixture:/etc/ssh/ssh_host_ed25519_key
+docker cp "$keys/fixture_client_key.pub" nastools-fixture:/home/nastools/.ssh/authorized_keys
 docker start nastools-fixture
 ```
 
@@ -167,15 +168,15 @@ nastools reads the client key only from the agent at `SSH_AUTH_SOCK`, and it che
 
 ```sh
 eval "$(ssh-agent -s)"
-ssh-add fixture_client_key
+ssh-add "$keys/fixture_client_key"
 export SSH_ADDRESS=127.0.0.1:2222
 export SSH_USER=nastools
-export SSH_KNOWN_HOSTS="[127.0.0.1]:2222 $(cat fixture_host_key.pub)"
+export SSH_KNOWN_HOSTS="[127.0.0.1]:2222 $(cat "$keys/fixture_host_key.pub")"
 export SSH_LOCK_DIR=/var/lib/nastools/locks
 nastools deploy --config path/to/nastools.toml
 ```
 
-A known-hosts entry for a port other than 22 puts the host in brackets. Afterwards, run `docker compose --project-name <project> down` against the local engine, remove the container with `docker rm --force nastools-fixture`, and stop the agent with `ssh-agent -k`.
+A known-hosts entry for a port other than 22 puts the host in brackets. Afterwards, run `docker compose --project-name <project> down` against the local engine, remove the container with `docker rm --force nastools-fixture`, stop the agent with `ssh-agent -k`, and remove the keys with `rm -r "$keys"`.
 
 Mounting the socket gives the fixture full control of the local engine. Publish its port on `127.0.0.1` only, and use keys made for the rehearsal. Because the fixture's engine is the local one, bind-mount sources and `file:` configs and secrets resolve on this machine. A rehearsal doesn't show that they exist on the device, and it doesn't replace the device qualification that the Serve section describes.
 

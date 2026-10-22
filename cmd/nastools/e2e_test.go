@@ -41,6 +41,7 @@ import (
 const (
 	fixtureUser  = "nastools"
 	serveLog     = "/var/lib/nastools/serve.log"
+	lockLog      = "/var/lib/nastools/flock.log"
 	fixtureLocks = "/var/lib/nastools/locks"
 	commitLabel  = "example.invalid/commit"
 	// sampleName is the name in testdata/fixture/project/nastools.toml that
@@ -115,7 +116,9 @@ func testDeploy(t *testing.T, f *sshFixture) {
 }
 
 // testLockContention holds the lock with one deploy and starts the others
-// only once the lock probe reports it busy.
+// only once the lock probe reports it busy. The fixture's lock log then shows
+// the waiting deploy refused while the first held the lock, and taking it
+// only after the first released it.
 func testLockContention(t *testing.T, f *sshFixture) {
 	t.Helper()
 	s := newScenario(t, f, "contention")
@@ -127,11 +130,16 @@ func testLockContention(t *testing.T, f *sshFixture) {
 	assert.Equal(t, exitError, busy.code, "%s", busy)
 	assert.Contains(t, busy.stderr, nastools.ErrBusy.Error())
 	require.True(t, s.locked(t), "the first deploy finished before the waiting deploy started")
+	// The first deploy holds the lock and the refused deploy has exited, so
+	// every attempt logged from here on comes from the waiting deploy. A refusal
+	// is logged after the fact, so one may also follow the release.
+	before := len(s.lockLog(t))
 	waiting := s.start(t, options{delay: holdDelay}, "deploy", "--lock-wait", "2m")
 	held, waited := first.wait(t), waiting.wait(t)
 	require.Equal(t, exitOK, held.code, "%s", held)
+	assert.Regexp(t, `^(busy )+released (busy )*acquired released$`, strings.Join(s.lockLog(t)[before:], " "),
+		"the waiting deploy didn't find the lock busy and take it after the first deploy released it")
 	require.Equal(t, exitOK, waited.code, "%s", waited)
-	assert.True(t, waited.ended.After(held.ended), "the waiting deploy finished before the first one")
 }
 
 // testLockRelease kills a deploy that holds the lock. The lock then comes
@@ -175,12 +183,10 @@ func testHostKeyMismatch(t *testing.T, f *sshFixture) {
 
 func startFixture(t *testing.T) *sshFixture {
 	t.Helper()
+	requireLocalEngine(t)
 	version, err := output(t.Context(), "docker", "version", "--format", "{{.Server.Version}}")
 	if err != nil {
-		if runtime.GOOS == "darwin" {
-			t.Skip("e2e: skipped: no Docker engine answers here, and hosted macOS runners have none")
-		}
-		t.Fatalf("e2e: the SSH engine fixture needs a Docker engine: %v", err)
+		noEngine(t, err)
 	}
 	compose := mustOutput(t, "docker", "compose", "version", "--short")
 	t.Logf("Docker Engine %s, Compose %s", strings.TrimSpace(version), strings.TrimSpace(compose))
@@ -211,6 +217,36 @@ func startFixture(t *testing.T) *sshFixture {
 	f.knownHosts = knownhosts.Line([]string{f.address}, publicKey(t, hostKey))
 	waitFor(t, "sshd to answer", func() bool { return sshAnswers(t.Context(), f.address) })
 	return f
+}
+
+// requireLocalEngine skips the test unless the Docker command-line tool
+// reaches an engine on this machine through a Unix socket. The fixture gets
+// full control of the engine it runs on, so it never runs on a remote one.
+// It reads only the environment and the Docker configuration, and doesn't
+// contact an engine.
+func requireLocalEngine(t *testing.T) {
+	t.Helper()
+	if host := os.Getenv("DOCKER_HOST"); host != "" && !strings.HasPrefix(host, "unix://") {
+		t.Skip("e2e: skipped: DOCKER_HOST isn't a unix:// socket, and the fixture runs only on a local engine")
+	}
+	endpoint, err := output(t.Context(), "docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}")
+	if err != nil {
+		noEngine(t, err)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(endpoint), "unix://") {
+		t.Skip("e2e: skipped: the active Docker context isn't a unix:// socket, " +
+			"and the fixture runs only on a local engine")
+	}
+}
+
+// noEngine ends a test when no Docker engine answers. It skips on macOS,
+// because hosted macOS runners have none.
+func noEngine(t *testing.T, err error) {
+	t.Helper()
+	if runtime.GOOS == "darwin" {
+		t.Skip("e2e: skipped: no Docker engine answers here, and hosted macOS runners have none")
+	}
+	t.Fatalf("e2e: the SSH engine fixture needs a Docker engine: %v", err)
 }
 
 // log returns everything the SSH server has logged.
@@ -296,7 +332,6 @@ type started struct {
 	stdout bytes.Buffer
 	stderr bytes.Buffer
 	done   chan struct{}
-	ended  time.Time
 }
 
 func (s *scenario) start(t *testing.T, o options, args ...string) *started {
@@ -316,8 +351,14 @@ func (s *scenario) start(t *testing.T, o options, args ...string) *started {
 		// The exit status is read from ProcessState after done closes.
 		waitErr := p.cmd.Wait()
 		_ = waitErr
-		p.ended = time.Now()
 	}()
+	// A failed assertion can skip the wait for the run. Cancel kills its
+	// process group if it's still running, and the cleanup waits for it to
+	// finish before the scenario's earlier cleanups remove engine resources.
+	t.Cleanup(func() {
+		cancel()
+		<-p.done
+	})
 	return p
 }
 
@@ -331,7 +372,6 @@ type result struct {
 	code   int
 	stdout string
 	stderr string
-	ended  time.Time
 }
 
 func (r result) String() string {
@@ -345,7 +385,6 @@ func (p *started) wait(t *testing.T) result {
 		code:   p.cmd.ProcessState.ExitCode(),
 		stdout: p.stdout.String(),
 		stderr: p.stderr.String(),
-		ended:  p.ended,
 	}
 }
 
@@ -376,13 +415,31 @@ func (s *scenario) serveEntries(t *testing.T) []string {
 	return slices.DeleteFunc(lines, func(line string) bool { return !strings.HasPrefix(line, "svc:"+s.project+"-") })
 }
 
+// lock returns the path of the scenario's lock inside the fixture.
+func (s *scenario) lock() string {
+	return path.Join(fixtureLocks, s.project+".lock")
+}
+
+// lockLog returns, in order, the events that the fixture's flock wrapper
+// logged for the scenario's lock: busy, acquired, or released.
+func (s *scenario) lockLog(t *testing.T) []string {
+	t.Helper()
+	var events []string
+	for line := range strings.Lines(mustOutput(t, "docker", "exec", s.container, "cat", lockLog)) {
+		event, lock, _ := strings.Cut(strings.TrimSpace(line), " ")
+		if lock == s.lock() {
+			events = append(events, event)
+		}
+	}
+	return events
+}
+
 // locked reports whether a `flock -n` probe inside the fixture finds the
 // scenario's lock held.
 func (s *scenario) locked(t *testing.T) bool {
 	t.Helper()
-	lock := path.Join(fixtureLocks, s.project+".lock")
 	_, err := output(t.Context(), "docker", "exec", "--user", fixtureUser, s.container,
-		"flock", "-n", "-E", strconv.Itoa(lockBusy), lock, "true")
+		"flock", "-n", "-E", strconv.Itoa(lockBusy), s.lock(), "true")
 	var exit *process.ExitError
 	if errors.As(err, &exit) && exit.ExitCode() == lockBusy {
 		return true

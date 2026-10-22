@@ -16,6 +16,7 @@ RUN apk add --no-cache docker-cli flock jq openssh-server shadow sudo \
 COPY sshd_config /etc/ssh/sshd_config
 COPY --chmod=440 sudoers /etc/sudoers.d/nastools
 COPY --chmod=755 tailscale.sh /usr/local/bin/tailscale
+COPY --chmod=755 flock.sh /usr/local/bin/flock
 COPY --chmod=755 start.sh /usr/local/sbin/start-fixture
 
 EXPOSE 22
