@@ -74,10 +74,11 @@ func readText(read func(string) ([]byte, error), dir, path string) string {
 // decode reads the config without its schema, falling back to scan on a
 // syntax error.
 func decode(data []byte, env map[string]string) discovered {
-	var doc map[string]any
-	if toml.Unmarshal(data, &doc) != nil {
+	var raw map[string]any
+	if toml.Unmarshal(data, &raw) != nil {
 		return scan(string(data), env)
 	}
+	doc := foldTable(raw)
 	found := discovered{
 		names:     texts(doc["required_env"]),
 		files:     texts(doc["files"]),
@@ -91,6 +92,48 @@ func decode(data []byte, env map[string]string) discovered {
 		}
 	}
 	return found
+}
+
+// fold lower-cases every key and merges the keys that then collide. The
+// strict decoder also lower-cases a key that matches no field exactly.
+func fold(value any) any {
+	switch v := value.(type) {
+	case []any:
+		result := make([]any, len(v))
+		for i, item := range v {
+			result[i] = fold(item)
+		}
+		return result
+	case map[string]any:
+		return foldTable(v)
+	}
+	return value
+}
+
+func foldTable(table map[string]any) map[string]any {
+	result := make(map[string]any, len(table))
+	for _, key := range slices.Sorted(maps.Keys(table)) {
+		lower := strings.ToLower(key)
+		result[lower] = merge(result[lower], fold(table[key]))
+	}
+	return result
+}
+
+// merge combines two values whose keys fold together. Tables merge key by
+// key, and any other pair becomes a list holding both.
+func merge(a, b any) any {
+	if a == nil {
+		return b
+	}
+	tableA, okA := a.(map[string]any)
+	tableB, okB := b.(map[string]any)
+	if !okA || !okB {
+		return []any{a, b}
+	}
+	for _, key := range slices.Sorted(maps.Keys(tableB)) {
+		tableA[key] = merge(tableA[key], tableB[key])
+	}
+	return tableA
 }
 
 // texts collects every string in a decoded config value.
@@ -111,8 +154,9 @@ func texts(value any) []string {
 	return result
 }
 
-// scan reads a config that fails to parse. It takes the quoted values under
-// [files] and [expand_files], and anywhere each quoted name the environment sets.
+// scan reads a config that fails to parse. It takes the quoted values of
+// [files] and [expand_files], whether a table header, a dotted key, or an
+// inline table holds them, and anywhere each quoted name the environment sets.
 func scan(data string, env map[string]string) discovered {
 	var found discovered
 	table := ""
@@ -120,27 +164,54 @@ func scan(data string, env map[string]string) discovered {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "[") {
 			header, _, _ := strings.Cut(line, "]")
-			table = strings.TrimSpace(strings.Trim(header, "["))
+			table = strings.Trim(header, "[")
 			continue
 		}
-		for _, match := range quoted.FindAllStringSubmatch(line, -1) {
-			if name := match[1] + match[2]; envName.MatchString(name) && env[name] != "" {
+		for _, name := range quotedTexts(line) {
+			if envName.MatchString(name) && env[name] != "" {
 				found.names = append(found.names, name)
 			}
 		}
-		_, value, ok := strings.Cut(line, "=")
-		match := quoted.FindStringSubmatch(value)
-		if !ok || match == nil {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
 			continue
 		}
-		switch table {
+		switch topTable(table, key) {
 		case "files":
-			found.files = append(found.files, match[1]+match[2])
+			found.files = append(found.files, quotedTexts(value)...)
 		case "expand_files":
-			found.templates = append(found.templates, match[1]+match[2])
+			found.templates = append(found.templates, quotedTexts(value)...)
 		}
 	}
 	return found
+}
+
+// topTable returns the top-level table that a key under a table header
+// belongs to, in lower case.
+func topTable(table, key string) string {
+	path := strings.ToLower(strings.Join(strings.Fields(table+"."+key), ""))
+	first, _, _ := strings.Cut(strings.TrimLeft(path, "."), ".")
+	return strings.Trim(first, `"'`)
+}
+
+func quotedTexts(text string) []string {
+	matches := quoted.FindAllStringSubmatch(text, -1)
+	result := make([]string, 0, len(matches))
+	for _, match := range matches {
+		result = append(result, match[1]+match[2])
+	}
+	return result
+}
+
+// Parses reports whether the config at path reads and passes the strict
+// decoder. Only then does Discover read every key the policy can use.
+func Parses(read func(string) ([]byte, error), path string) bool {
+	data, err := read(path)
+	if err != nil {
+		return false
+	}
+	_, err = parse(data)
+	return err == nil
 }
 
 type cachedFile struct {

@@ -94,23 +94,27 @@ func (g *Gate) Err() error {
 	return g.err
 }
 
-// Close flushes partial lines, redacted, and reports any mask-write failure.
+// Close flushes partial lines, redacted, and reports any mask-write failure,
+// including one that a name in a flushed line causes.
 func (g *Gate) Close() error {
 	if !g.active {
 		return nil
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	errs := []error{g.err}
+	var errs []error
 	for _, s := range []*stream{g.stdout, g.stderr} {
 		if len(s.pending) > 0 {
 			errs = append(errs, s.emit(len(s.pending)))
 		}
 	}
-	return errors.Join(errs...)
+	return errors.Join(append(errs, g.err)...)
 }
 
+// register adds a value without its trailing newlines. A value then counts
+// as multi-line only for a newline within it.
 func (g *Gate) register(value string, derived bool) {
+	value = strings.TrimRight(value, "\r\n")
 	if strings.TrimSpace(value) == "" || g.masked[value] || (derived && len(value) < minDerived) {
 		return
 	}
@@ -177,13 +181,39 @@ func (g *Gate) redact(line string) string {
 				found = true
 			}
 		}
-		for _, secret := range g.secrets {
-			line = strings.ReplaceAll(line, secret, placeholder)
-		}
+		line = g.replace(line)
 		if !found {
 			return line
 		}
 	}
+}
+
+// replace swaps each run of bytes that any known value covers for one
+// placeholder. Values that overlap then don't leave part of either behind.
+func (g *Gate) replace(line string) string {
+	covered := make([]bool, len(line))
+	for _, secret := range g.secrets {
+		for start := 0; ; start++ {
+			i := strings.Index(line[start:], secret)
+			if i < 0 {
+				break
+			}
+			start += i
+			for j := range len(secret) {
+				covered[start+j] = true
+			}
+		}
+	}
+	var b strings.Builder
+	for i := range len(line) {
+		switch {
+		case !covered[i]:
+			b.WriteByte(line[i])
+		case i == 0 || !covered[i-1]:
+			b.WriteString(placeholder)
+		}
+	}
+	return b.String()
 }
 
 // cut returns where to split a long line: before the tail that could hold the

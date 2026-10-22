@@ -20,10 +20,11 @@ import (
 )
 
 const (
-	secret     = "secret-1.example.invalid"
-	tailnet    = "node.example.ts.net"
-	maskPrefix = "::add-mask::"
-	knownHosts = "secret-4.example.invalid ssh-ed25519 " +
+	placeholder = "***"
+	secret      = "secret-1.example.invalid"
+	tailnet     = "node.example.ts.net"
+	maskPrefix  = "::add-mask::"
+	knownHosts  = "secret-4.example.invalid ssh-ed25519 " +
 		"AAAAC3NzaC1lZDI1NTE5AAAAICZ4niA2YR6ErsZQRahQYkioleR/p9/qUOStEMhVy/K5\n" +
 		"[secret-5.example.invalid]:2222 ssh-ed25519 " +
 		"AAAAC3NzaC1lZDI1NTE5AAAAICZ4niA2YR6ErsZQRahQYkioleR/p9/qUOStEMhVy/K5\n"
@@ -92,7 +93,7 @@ func TestInactivePassesThrough(t *testing.T) {
 func TestMasksAndRedactsDerivedForms(t *testing.T) {
 	t.Parallel()
 	g, log := gate(0)
-	g.Add(secret, "secret-2.example.invalid:22", knownHosts, "", "  ", secret, "%\r")
+	g.Add(secret, "secret-2.example.invalid:22", knownHosts, "", "  ", secret, "%\r%")
 	_, err := io.WriteString(
 		g.Stderr(),
 		"a secret-1.example.invalid b\nsecret-2.example.invalid secret-4.example.invalid",
@@ -105,12 +106,12 @@ func TestMasksAndRedactsDerivedForms(t *testing.T) {
 	assert.Equal(t, maskPrefix+secret+"\n"+
 		maskPrefix+"secret-2.example.invalid:22\n"+
 		maskPrefix+"secret-2.example.invalid\n"+
-		maskPrefix+strings.ReplaceAll(knownHosts, "\n", "%0A")+"\n"+
+		maskPrefix+strings.ReplaceAll(strings.TrimSuffix(knownHosts, "\n"), "\n", "%0A")+"\n"+
 		maskPrefix+line(0)+"\n"+
 		maskPrefix+"secret-4.example.invalid\n"+
 		maskPrefix+line(1)+"\n"+
 		maskPrefix+"secret-5.example.invalid\n"+
-		maskPrefix+"%25%0D\n"+
+		maskPrefix+"%25%0D%25\n"+
 		"c ***\npartial", text(*log, "out"))
 	assert.Equal(t, "a *** b\n*** ***", text(*log, "err"))
 }
@@ -133,12 +134,45 @@ func TestTailnetNameMaskedBeforeItsLine(t *testing.T) {
 func TestReplacementCannotExposeAName(t *testing.T) {
 	t.Parallel()
 	g, log := gate(0)
-	// Replacing the longer value first leaves part of the name for a second pass.
+	// The value and the name overlap, so neither may leave part of the other.
 	g.Add("long-secret-token=abc-node")
 	_, err := io.WriteString(g.Stderr(), "long-secret-token=abc-node-2.example.ts.net\n")
 	require.NoError(t, err)
 	require.NoError(t, g.Close())
-	assert.Equal(t, "******\n", text(*log, "err"))
+	assert.Equal(t, "***\n", text(*log, "err"))
+}
+
+func TestOverlappingValues(t *testing.T) {
+	t.Parallel()
+	g, log := gate(0)
+	g.Add("overlap", "lapping", "ping-pong")
+	_, err := io.WriteString(g.Stderr(), "an overlapping-pong one, overlap lapping\n")
+	require.NoError(t, err)
+	require.NoError(t, g.Close())
+	assert.Equal(t, "an *** one, *** ***\n", text(*log, "err"))
+}
+
+func TestTrailingNewlineValue(t *testing.T) {
+	t.Parallel()
+	g, log := gate(0)
+	g.Add("abc1234\n", "def5678\r\n", "first-line\nx\n")
+	_, err := io.WriteString(g.Stderr(), "abc1234 def5678 first-line x\n")
+	require.NoError(t, err)
+	require.NoError(t, g.Close())
+	assert.Equal(t, maskPrefix+"abc1234\n"+maskPrefix+"def5678\n"+
+		maskPrefix+"first-line%0Ax\n"+maskPrefix+"first-line\n", text(*log, "out"))
+	assert.Equal(t, "*** *** *** x\n", text(*log, "err"))
+}
+
+func TestCloseReportsFlushMaskFailure(t *testing.T) {
+	t.Parallel()
+	g, log := gate(1)
+	// The name is new and its line is partial, so only Close writes its mask.
+	_, err := io.WriteString(g.Stderr(), "serving "+tailnet)
+	require.NoError(t, err)
+	require.NoError(t, g.Err())
+	require.ErrorIs(t, g.Close(), errBroken)
+	assert.Equal(t, "serving ***", text(*log, "err"))
 }
 
 func TestMaskFailureIsSticky(t *testing.T) {
@@ -265,25 +299,33 @@ func run(t *testing.T, secrets []string, input string, splits []byte) []entry {
 	return *log
 }
 
+// FuzzGate builds two secrets that overlap by overlap bytes, a+b[:overlap]
+// and b, and checks a line holding a+b besides the fuzzed input.
 func FuzzGate(f *testing.F) {
 	f.Add(
 		secret,
 		"secret-2.example.invalid:22",
 		"a "+secret+" b\n"+tailnet+"\nsecret-2.example.invalid",
 		[]byte{0, 4, 2},
+		uint8(0),
 	)
-	f.Add("overlap", "lapping", "overlapping\nan overlapping one\n", []byte{2})
-	f.Add("prefix-node", "x", "prefix-node.example.ts.net prefix-nodes.example.ts.net\n\n", []byte{6, 0})
-	f.Add("%", "\r", "100%\r\n", []byte{})
-	f.Fuzz(func(t *testing.T, a, b, input string, splits []byte) {
+	f.Add("over", "lapping", "an overlapping one\n", []byte{2}, uint8(3))
+	f.Add("prefix-node", "x", "prefix-node.example.ts.net prefix-nodes.example.ts.net\n\n", []byte{6, 0}, uint8(1))
+	f.Add("%", "\r", "100%\r\n", []byte{}, uint8(0))
+	f.Fuzz(func(t *testing.T, a, b, input string, splits []byte, overlap uint8) {
 		if len(input) > 4096 {
 			t.Skip("long lines have their own test")
 		}
 		var secrets []string
-		for _, value := range []string{a, b} {
-			if !strings.ContainsAny(value, "*\n") && strings.TrimSpace(value) != "" {
+		for _, value := range []string{a + b[:int(overlap)%(len(b)+1)], b} {
+			// The gate drops a trailing carriage return, which the line check
+			// below would then find uncovered.
+			if !strings.ContainsAny(value, "*\n") && !strings.HasSuffix(value, "\r") && strings.TrimSpace(value) != "" {
 				secrets = append(secrets, value)
 			}
+		}
+		if len(secrets) == 2 {
+			input = a + b + "\n" + input
 		}
 		whole := run(t, secrets, input, nil)
 		chunked := run(t, secrets, input, append(splits, 0))
@@ -291,6 +333,11 @@ func FuzzGate(f *testing.F) {
 		assert.Equal(t, text(whole, "err"), text(chunked, "err"))
 		assertNoSurvivors(t, whole, secrets)
 		assertMasksFirst(t, whole, input)
+		if len(secrets) == 2 {
+			// The secrets cover the whole line between them.
+			first, _, _ := strings.Cut(text(whole, "err"), "\n")
+			assert.Equal(t, placeholder, first)
+		}
 	})
 }
 

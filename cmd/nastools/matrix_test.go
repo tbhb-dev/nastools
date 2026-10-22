@@ -77,11 +77,13 @@ func matrixFake() *nastoolstest.Fake {
 }
 
 // fixture changes the config or injects a fault. unmasked lists the values
-// whose only source the change removes.
+// whose only source the change removes. broken marks a config that fails
+// the strict parse.
 type fixture struct {
 	name     string
 	change   func(*nastoolstest.Fake)
 	unmasked []string
+	broken   bool
 }
 
 func fixtures() []fixture {
@@ -91,33 +93,46 @@ func fixtures() []fixture {
 	replace := func(old, replacement string) func(*nastoolstest.Fake) {
 		return config(func(text string) string { return strings.Replace(text, old, replacement, 1) })
 	}
+	// Without its table, the template comes from a declaration on one line.
+	expandOnly := func(declaration string) func(*nastoolstest.Fake) {
+		return config(func(text string) string {
+			text = strings.Replace(text, "[expand_files]\nEXPANDED_INPUT = \"expanded.txt\"\n", "", 1)
+			return "project = = 'x'\n" + declaration + "\n" + text
+		})
+	}
 	return []fixture{
-		{"valid", func(*nastoolstest.Fake) {}, nil},
-		{"syntax error", config(func(text string) string { return "project = = 'x'\n" + text }), nil},
-		{"unknown field first", config(func(text string) string { return "unknown = 'x'\n" + text }), nil},
-		{"invalid serve", replace("https = 443", "https = 0"), nil},
-		{"duplicate output", replace("EXPANDED_INPUT =", "STATIC_INPUT ="), nil},
-		{"missing env", replace(`["REQUIRED_INPUT"]`, `["REQUIRED_INPUT", "ABSENT_INPUT"]`), nil},
+		{"valid", func(*nastoolstest.Fake) {}, nil, false},
+		{"syntax error", config(func(text string) string { return "project = = 'x'\n" + text }), nil, true},
+		{"syntax error, dotted", expandOnly(`expand_files.EXPANDED_INPUT = "expanded.txt"`), nil, true},
+		{"syntax error, inline", expandOnly(`expand_files = { EXPANDED_INPUT = 'expanded.txt' }`), nil, true},
+		{"unknown field first", config(func(text string) string { return "unknown = 'x'\n" + text }), nil, true},
+		{"upper-case keys", config(strings.NewReplacer(
+			"required_env", "REQUIRED_ENV", "[ssh]", "[SSH]", "address_env", "ADDRESS_ENV",
+			"[files]", "[FILES]", "[expand_files]", "[EXPAND_FILES]",
+		).Replace), nil, false},
+		{"invalid serve", replace("https = 443", "https = 0"), nil, false},
+		{"duplicate output", replace("EXPANDED_INPUT =", "STATIC_INPUT ="), nil, false},
+		{"missing env", replace(`["REQUIRED_INPUT"]`, `["REQUIRED_INPUT", "ABSENT_INPUT"]`), nil, false},
 		{"template read", func(f *nastoolstest.Fake) { delete(f.Files, "expanded.txt") }, []string{
 			"secret-5.example.invalid",
-		}},
+		}, false},
 		{"static read", func(f *nastoolstest.Fake) { delete(f.Files, "static.txt") }, []string{
 			"secret-7.example.invalid",
-		}},
-		{"git", func(f *nastoolstest.Fake) { f.GitErr = nastoolstest.ErrPrivate }, nil},
-		{"compose config", func(f *nastoolstest.Fake) { f.FailCommand = "config" }, nil},
-		{"compose pull", func(f *nastoolstest.Fake) { f.FailCommand = "pull" }, nil},
-		{"compose up", func(f *nastoolstest.Fake) { f.FailCommand = "up" }, nil},
-		{"compose ps", func(f *nastoolstest.Fake) { f.FailCommand = "ps" }, nil},
-		{"compose logs", func(f *nastoolstest.Fake) { f.FailCommand = "logs" }, nil},
-		{"open", func(f *nastoolstest.Fake) { f.OpenErr = nastoolstest.ErrPrivate }, nil},
-		{"lock error", func(f *nastoolstest.Fake) { f.LockErrors = []error{nastoolstest.ErrPrivate} }, nil},
-		{"lock busy", func(f *nastoolstest.Fake) { f.LockErrors = []error{nastools.ErrBusy} }, nil},
-		{"serve", func(f *nastoolstest.Fake) { f.RemoteFail = "--https=443" }, nil},
-		{"serve status", func(f *nastoolstest.Fake) { f.RemoteFail = "status" }, nil},
+		}, false},
+		{"git", func(f *nastoolstest.Fake) { f.GitErr = nastoolstest.ErrPrivate }, nil, false},
+		{"compose config", func(f *nastoolstest.Fake) { f.FailCommand = "config" }, nil, false},
+		{"compose pull", func(f *nastoolstest.Fake) { f.FailCommand = "pull" }, nil, false},
+		{"compose up", func(f *nastoolstest.Fake) { f.FailCommand = "up" }, nil, false},
+		{"compose ps", func(f *nastoolstest.Fake) { f.FailCommand = "ps" }, nil, false},
+		{"compose logs", func(f *nastoolstest.Fake) { f.FailCommand = "logs" }, nil, false},
+		{"open", func(f *nastoolstest.Fake) { f.OpenErr = nastoolstest.ErrPrivate }, nil, false},
+		{"lock error", func(f *nastoolstest.Fake) { f.LockErrors = []error{nastoolstest.ErrPrivate} }, nil, false},
+		{"lock busy", func(f *nastoolstest.Fake) { f.LockErrors = []error{nastools.ErrBusy} }, nil, false},
+		{"serve", func(f *nastoolstest.Fake) { f.RemoteFail = "--https=443" }, nil, false},
+		{"serve status", func(f *nastoolstest.Fake) { f.RemoteFail = "status" }, nil, false},
 		{"bad status JSON", func(f *nastoolstest.Fake) {
 			f.RemoteStatus = "not json " + strings.Join(canaries(), " ")
-		}, nil},
+		}, nil, false},
 	}
 }
 
@@ -146,6 +161,8 @@ func (w *faultyWriter) String() string { return w.buf.String() }
 type matrixCase struct {
 	name     string
 	fixture  fixture
+	command  string
+	shape    string
 	args     []string
 	failAt   int
 	noConfig bool
@@ -159,6 +176,7 @@ func matrixCases() []matrixCase {
 	commands := map[string][]string{
 		"check": {"check"}, "deploy": {"deploy"}, "status": {"status"}, "logs": {"logs"},
 		"logs svc": {"logs", "web"}, "version": {"version"}, "unknown": {"unknown-command"},
+		"help": {"help"}, "complete": {"__complete"}, "complete no desc": {"__completeNoDesc"},
 	}
 	shapes := map[string][]string{
 		"valid":          nil,
@@ -166,12 +184,14 @@ func matrixCases() []matrixCase {
 		"bad lock wait":  {"--lock-wait", canary},
 		"unknown flag":   {"--" + canary},
 		"extra argument": {canary, canary},
+		// The template references this value, so only discovery knows it.
+		"template value": {"secret-5.example.invalid", "secret-5.example.invalid"},
 		"help":           {"--help"},
 		"short help":     {"-h"},
 		"missing config": {"--config=missing.toml"},
 	}
-	// The fixture's discovery writes ten masks.
-	writers := map[string]int{"healthy": 0, "first write fails": 1, "write after masks fails": 11}
+	// The fixture's discovery writes nine masks.
+	writers := map[string]int{"healthy": 0, "first write fails": 1, "write after masks fails": 10}
 	all := fixtures()
 	cases := make([]matrixCase, 0, len(all)*len(commands)*len(shapes)*len(writers))
 	for _, fx := range all {
@@ -181,6 +201,8 @@ func matrixCases() []matrixCase {
 					cases = append(cases, matrixCase{
 						name:     fx.name + "/" + command + "/" + shape + "/" + writer,
 						fixture:  fx,
+						command:  command,
+						shape:    shape,
 						args:     slices.Concat(commandArgs, shapeArgs),
 						failAt:   failAt,
 						noConfig: shape == "missing config",
@@ -206,11 +228,42 @@ func TestRunNeverPrintsPrivateValues(t *testing.T) {
 			if !tc.noConfig {
 				masks = expectedMasks(tc.fixture.unmasked)
 			}
-			assertGated(t, out, errOut.String(), masks)
+			// nastools can't know a value whose only source it can't read, so
+			// it may echo that value from its arguments.
+			private := slices.DeleteFunc(canaries(), func(value string) bool {
+				return slices.Contains(tc.fixture.unmasked, value) && slices.Contains(tc.args, value)
+			})
+			assertGated(t, out, errOut.String(), masks, private)
 			if out.maskFailed {
 				assert.NotEqual(t, exitOK, code)
 			}
+			if tc.failAt == 0 {
+				assertExit(t, tc, code, errOut.String())
+			}
 		})
+	}
+}
+
+// assertExit checks the exit status of every case whose outcome the fixture
+// doesn't decide, and that an error that could echo the arguments prints
+// only the generic message.
+func assertExit(t *testing.T, tc matrixCase, code int, stderr string) {
+	t.Helper()
+	remote := !slices.Contains([]string{"version", "unknown", "help", "complete", "complete no desc"}, tc.command)
+	complete := strings.HasPrefix(tc.command, "complete")
+	switch {
+	case complete:
+		assert.Equal(t, exitError, code)
+		assert.Equal(t, "nastools: invalid or missing input\n", stderr)
+	case tc.shape == "help" || tc.shape == "short help":
+		assert.Equal(t, tc.command == "unknown", code == exitError)
+	case tc.shape != "valid", tc.command == "unknown":
+		assert.Equal(t, exitError, code)
+	case !remote:
+		assert.Equal(t, exitOK, code)
+	}
+	if code != exitOK && (remote || tc.fixture.broken || tc.noConfig) {
+		assert.True(t, strings.HasSuffix(stderr, ": invalid or missing input\n"), stderr)
 	}
 }
 
@@ -232,7 +285,7 @@ func expectedMasks(unmasked []string) map[string]bool {
 // assertGated checks that neither stream contains a canary outside a mask
 // command, and that with standard output healthy every expected mask comes before
 // the first other line.
-func assertGated(t *testing.T, out *faultyWriter, stderr string, masks map[string]bool) {
+func assertGated(t *testing.T, out *faultyWriter, stderr string, masks map[string]bool, private []string) {
 	t.Helper()
 	before := make(map[string]bool)
 	other := false
@@ -242,13 +295,13 @@ func assertGated(t *testing.T, out *faultyWriter, stderr string, masks map[strin
 			before[strings.TrimSuffix(value, "\n")] = true
 		}
 		other = other || !isMask
-		for _, canary := range canaries() {
+		for _, canary := range private {
 			if !isMask {
 				assert.NotContains(t, line, canary)
 			}
 		}
 	}
-	for _, canary := range canaries() {
+	for _, canary := range private {
 		assert.NotContains(t, stderr, canary)
 	}
 	if out.failAt == 0 {
@@ -342,7 +395,7 @@ func TestLateMaskFailureFailsRun(t *testing.T) {
 	f := matrixFake()
 	f.Canaries = nil
 	f.Files["nastools.toml"] = strings.Split(matrixConfig, "[[serve]]")[0]
-	out, errOut := &faultyWriter{failAt: 11}, &faultyWriter{}
+	out, errOut := &faultyWriter{failAt: 10}, &faultyWriter{}
 	code := Run(t.Context(), []string{"deploy"}, streams{in: strings.NewReader(""), out: out, err: errOut},
 		stderrOnly{f}, matrixEnv())
 	assert.True(t, out.maskFailed)

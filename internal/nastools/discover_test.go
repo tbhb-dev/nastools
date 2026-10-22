@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"unicode"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -63,28 +64,87 @@ func TestDiscoverSuperset(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			env := discoverEnv()
-			got := discover(discoverFiles(config), env)
-			strict := func(env map[string]string) error {
-				f := &nastoolstest.Fake{Files: discoverFiles(config)}
-				return nastools.Execute(t.Context(), f, "deployment/nastools.toml", env, nil, nil,
-					nastools.Command{Name: nastools.CheckName})
-			}
-			require.NoError(t, strict(env))
-			for _, name := range slices.Sorted(maps.Keys(env)) {
-				reduced := maps.Clone(env)
-				delete(reduced, name)
-				if strict(reduced) != nil {
-					assert.Contains(t, got, env[name], name)
-				}
-			}
-			assert.NotContains(t, got, env["UNUSED_INPUT"])
-			if strings.Contains(config, "static.txt") {
-				assert.Contains(t, got, "secret-7.example.invalid")
-			}
-			assert.NotContains(t, got, "short")
+			assertSuperset(t, config)
 		})
 	}
+}
+
+// FuzzDiscoverAnyCase runs the TestDiscoverSuperset check on valid configs
+// whose keys use any case, as the strict decoder accepts. Bit n of casing
+// upper-cases letter n of the keys, wrapping after 64.
+func FuzzDiscoverAnyCase(f *testing.F) {
+	for i := range uint64(64) {
+		f.Add(i*0x9e3779b97f4a7c15, i%2 == 0)
+	}
+	f.Fuzz(func(t *testing.T, casing uint64, tables bool) {
+		bit := 0
+		k := func(key string) string {
+			runes := []rune(key)
+			for i := range runes {
+				if casing>>(bit%64)&1 == 1 {
+					runes[i] = unicode.ToUpper(runes[i])
+				}
+				bit++
+			}
+			return string(runes)
+		}
+		config := k("project") + " = \"example\"\n" + k("compose") + " = [\"compose.yaml\"]\n"
+		if tables {
+			config += k("required_env") + " = [\"REQUIRED_INPUT\"]\n[" + k("ssh") + "]\n" +
+				k("address_env") + " = \"SSH_ADDRESS\"\n" + k("user_env") + " = \"SSH_USER\"\n" +
+				k("known_hosts_env") + " = \"SSH_KNOWN_HOSTS\"\n" + k("lock_dir") + " = \"/example.invalid/locks\"\n" +
+				"[" + k("files") + "]\nSTATIC_INPUT = \"static.txt\"\n[" + k("expand_files") + "]\nA_OUTPUT = \"a.txt\"\n"
+		} else {
+			config += k(
+				"expand_files",
+			) + ".B_OUTPUT = \"b.txt\"\n" + k(
+				"files",
+			) + " = { STATIC_INPUT = \"static.txt\" }\n" +
+				k(
+					"required_env",
+				) + " = [\"REQUIRED_INPUT\"]\n" + k(
+				"ssh",
+			) + " = { " +
+				k(
+					"address_env",
+				) + " = \"SSH_ADDRESS\", " + k(
+				"user_env",
+			) + " = \"SSH_USER\", " +
+				k(
+					"known_hosts_env",
+				) + " = \"SSH_KNOWN_HOSTS\", " + k(
+				"lock_dir",
+			) + " = \"/example.invalid/locks\" }\n"
+		}
+		assertSuperset(t, config)
+	})
+}
+
+func assertSuperset(t *testing.T, config string) {
+	t.Helper()
+	env := discoverEnv()
+	got := discover(discoverFiles(config), env)
+	strict := func(env map[string]string) error {
+		f := &nastoolstest.Fake{Files: discoverFiles(config)}
+		return nastools.Execute(t.Context(), f, "deployment/nastools.toml", env, nil, nil,
+			nastools.Command{Name: nastools.CheckName})
+	}
+	require.NoError(t, strict(env), config)
+	noticed := 0
+	for _, name := range slices.Sorted(maps.Keys(env)) {
+		reduced := maps.Clone(env)
+		delete(reduced, name)
+		if strict(reduced) != nil {
+			noticed++
+			assert.Contains(t, got, env[name], name)
+		}
+	}
+	assert.GreaterOrEqual(t, noticed, 4, config)
+	assert.NotContains(t, got, env["UNUSED_INPUT"])
+	if strings.Contains(config, "static.txt") {
+		assert.Contains(t, got, "secret-7.example.invalid")
+	}
+	assert.NotContains(t, got, "short")
 }
 
 func TestDiscoverTolerance(t *testing.T) {
@@ -96,12 +156,13 @@ func TestDiscoverTolerance(t *testing.T) {
 	tail := "required_env = [\"REQUIRED_INPUT\"]\n[ssh]\naddress_env = \"SSH_ADDRESS\"\n" +
 		"user_env = 'SSH_USER'\nknown_hosts_env = \"SSH_KNOWN_HOSTS\"\n" +
 		"[ files ] # static\nSTATIC_INPUT = \"static.txt\"\n[expand_files]\nA_OUTPUT = \"a.txt\"\nB_OUTPUT = \"b.txt\"\n"
-	for _, tc := range []struct {
+	type toleranceCase struct {
 		name   string
 		config string
 		files  func(map[string]string)
 		want   []string
-	}{
+	}
+	fixed := []toleranceCase{
 		{"syntax error", "project = = 'example'\n" + tail, nil, all},
 		{"syntax error after tables", tail + "[[serve]]\nservice = svc:web\n", nil, all},
 		{"unknown field first", "unknown = 'example'\n" + tail, nil, all},
@@ -113,7 +174,37 @@ func TestDiscoverTolerance(t *testing.T) {
 		{"unreadable first template", tail, func(files map[string]string) {
 			delete(files, "deployment/a.txt")
 		}, slices.DeleteFunc(slices.Clone(all), func(v string) bool { return v == "secret-5.example.invalid" })},
+	}
+	generated := make([]toleranceCase, 0, 21)
+	// The strict decoder matches a key in any case, so each variant must
+	// still yield every value, with or without a syntax error.
+	for _, variant := range [][2]string{
+		{"required_env", "REQUIRED_ENV"},
+		{"[ssh]", "[SSH]"},
+		{"address_env", "ADDRESS_ENV"},
+		{"[ files ]", "[ FILES ]"},
+		{"[expand_files]", "[EXPAND_FILES]"},
 	} {
+		config := strings.Replace(tail, variant[0], variant[1], 1)
+		generated = append(generated,
+			toleranceCase{variant[1], config, nil, all},
+			toleranceCase{variant[1] + " with unknown field", "unknown = 'example'\n" + config, nil, all},
+			toleranceCase{variant[1] + " with syntax error", "project = = 'example'\n" + config, nil, all})
+	}
+	for _, form := range []string{
+		"expand_files.A_OUTPUT = \"a.txt\"\nEXPAND_FILES . B_OUTPUT = 'b.txt'\n",
+		"expand_files = { A_OUTPUT = \"a.txt\", B_OUTPUT = 'b.txt' }\n",
+		"Expand_Files = {A_OUTPUT='a.txt',B_OUTPUT=\"b.txt\"}\n",
+	} {
+		for _, broken := range []string{"project = = 'example'\n", "unknown = 'example'\n"} {
+			generated = append(generated, toleranceCase{
+				broken + form, broken + form + "[files]\nSTATIC_INPUT = 'static.txt'\n",
+				nil,
+				[]string{"secret-5.example.invalid", "secret-6.example.invalid", "secret-7.example.invalid"},
+			})
+		}
+	}
+	for _, tc := range slices.Concat(fixed, generated) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			files := discoverFiles(tc.config)

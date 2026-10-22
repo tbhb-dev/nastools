@@ -6,10 +6,13 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/tbhb-dev/nastools/internal/buildmeta"
 	"github.com/tbhb-dev/nastools/internal/nastools/nastoolstest"
@@ -104,4 +107,81 @@ func TestCheckUnreadableConfig(t *testing.T) {
 	assert.Empty(t, out.String())
 	assert.Contains(t, errOut.String(), "nastools.toml: unreadable input")
 	assert.NotContains(t, errOut.String(), "private.example.invalid")
+}
+
+// TestBrokenConfigHidesArguments checks that under Actions, when the config
+// doesn't parse, no error echoes the arguments, whatever discovery found.
+func TestBrokenConfigHidesArguments(t *testing.T) {
+	t.Parallel()
+	const argument = "argument.example.invalid"
+	for _, args := range [][]string{
+		{"version", argument},
+		{argument},
+		{"help", argument},
+		{"version", "--" + argument},
+		{"deploy", "--lock-wait", argument},
+	} {
+		for _, broken := range []bool{false, true} {
+			t.Run(fmt.Sprint(args, broken), func(t *testing.T) {
+				t.Parallel()
+				config := "project = 'example'\n"
+				if broken {
+					config = "project = = 'example'\n"
+				}
+				var out, errOut bytes.Buffer
+				code := Run(t.Context(), args, streams{in: strings.NewReader(""), out: &out, err: &errOut},
+					&nastoolstest.Fake{Files: map[string]string{"nastools.toml": config}},
+					map[string]string{"GITHUB_ACTIONS": "true"})
+				assert.Equal(t, exitError, code)
+				assert.Empty(t, out.String())
+				if broken || args[0] == "deploy" {
+					assert.Equal(t, "nastools: invalid or missing input\n", errOut.String())
+				} else {
+					assert.Contains(t, errOut.String(), argument)
+				}
+			})
+		}
+	}
+}
+
+// TestConfigArgument checks the config path against the flag parser of the
+// command tree, for every argument list that parses.
+func TestConfigArgument(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{nil, "nastools.toml"},
+		{[]string{"deploy"}, "nastools.toml"},
+		{[]string{"deploy", "--config", "a.toml"}, "a.toml"},
+		{[]string{"deploy", "--config=a.toml"}, "a.toml"},
+		{[]string{"deploy", "--config="}, ""},
+		{[]string{"deploy", "--config", "a.toml", "--config=b.toml"}, "b.toml"},
+		{[]string{"deploy", "--config", "--", "--config", "b.toml"}, "b.toml"},
+		{[]string{"deploy", "--config", "--config=b.toml"}, "--config=b.toml"},
+		{[]string{"deploy", "--config", "-h"}, "-h"},
+		{[]string{"deploy", "--", "--config", "b.toml"}, "nastools.toml"},
+		{[]string{"deploy", "--config=a.toml", "--", "--config=b.toml"}, "a.toml"},
+		{[]string{"--config", "a.toml", "deploy"}, "a.toml"},
+		{[]string{"logs", "web", "--follow", "--config", "a.toml"}, "a.toml"},
+		{[]string{"deploy", "--lock-wait", "1s", "--config", "a.toml"}, "a.toml"},
+		// The flag parser stops at these errors, and nothing reads a config.
+		{[]string{"deploy", "--config"}, "nastools.toml"},
+		{[]string{"deploy", "--unknown", "--config", "a.toml"}, "a.toml"},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, configArgument(tc.args))
+			root := newRootCmd(t.Context(), streams{in: strings.NewReader(""), out: io.Discard, err: io.Discard},
+				&nastoolstest.Fake{}, nil)
+			target, flags, err := root.Find(tc.args)
+			if err != nil || target == root || target.ParseFlags(flags) != nil {
+				return
+			}
+			got, err := target.Flags().GetString("config")
+			require.NoError(t, err)
+			assert.Equal(t, got, configArgument(tc.args))
+		})
+	}
 }

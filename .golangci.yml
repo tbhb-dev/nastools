@@ -174,13 +174,21 @@ linters:
         - map
 
     # Process output passes the redact gate. Only cmd/nastools/main.go holds
-    # the process streams; see the exclusion rule below.
+    # the process streams; see the exclusion rule below. Type analysis
+    # matches package names, so an import alias doesn't hide a call.
+    # internal/redact/guard_test.go rejects the device paths of the streams.
     forbidigo:
+      analyze-types: true
       forbid:
-        - pattern: ^os\.(Stdout|Stderr)$
+        - pattern: ^os\.(Stdout|Stderr|NewFile)$
           msg: write through the gate's writers instead
         - pattern: ^(fmt\.Print(f|ln)?|log\.(Print|Fatal|Panic)(f|ln)?|print|println)$
           msg: write through the gate's writers instead
+        - pattern: ^syscall\.(Stdout|Stderr|Write)$
+          msg: write through the gate's writers instead
+        - pattern: ^slog\.(Debug|Info|Warn|Error|Log|LogAttrs|Default)(Context)?$
+          pkg: ^log/slog$
+          msg: slog's default logger writes to standard error; write through the gate's writers instead
 
     funlen:
       lines: 100
