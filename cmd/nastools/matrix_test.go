@@ -316,16 +316,24 @@ func TestRunNeverPrintsPrivateValues(t *testing.T) {
 			if out.maskFailed {
 				assert.NotEqual(t, exitOK, code)
 			}
-			if tc.afterMasks {
-				// Every discovery mask got through, and only those.
-				assert.Equal(t, tc.failAt-1, strings.Count(out.String(), maskPrefix))
-				assert.NotContains(t, errOut.String(), "nastools: mask output:")
-			}
+			assertAfterMasks(t, tc, out, errOut.String())
 			if tc.failAt == 0 {
 				assertExit(t, tc, code, errOut.String())
 			}
 		})
 	}
+}
+
+// assertAfterMasks checks that, when standard output fails on the first
+// write after the discovery masks, every discovery mask got through, and
+// only those.
+func assertAfterMasks(t *testing.T, tc matrixCase, out *faultyWriter, stderr string) {
+	t.Helper()
+	if !tc.afterMasks {
+		return
+	}
+	assert.Equal(t, tc.failAt-1, strings.Count(out.String(), maskPrefix))
+	assert.NotContains(t, stderr, "nastools: mask output:")
 }
 
 // assertExit checks the exit status of every case whose outcome the fixture
