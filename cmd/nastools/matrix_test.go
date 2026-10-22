@@ -138,6 +138,8 @@ func fixtures() []fixture {
 			"secret-7.example.invalid",
 		}, false},
 		{"git", func(f *nastoolstest.Fake) { f.GitErr = nastoolstest.ErrPrivate }, nil, false},
+		{"compose version probe", func(f *nastoolstest.Fake) { f.VersionErr = nastoolstest.ErrPrivate }, nil, false},
+		{"compose too old", func(f *nastoolstest.Fake) { f.ComposeVersion = []byte("2.23.0\n") }, nil, false},
 		{"compose config", func(f *nastoolstest.Fake) { f.FailCommand = "config" }, nil, false},
 		{"compose pull", func(f *nastoolstest.Fake) { f.FailCommand = "pull" }, nil, false},
 		{"compose up", func(f *nastoolstest.Fake) { f.FailCommand = "up" }, nil, false},
@@ -459,18 +461,20 @@ func TestMaskFailureStopsBeforeExecuting(t *testing.T) {
 }
 
 // stderrOnly writes the host name to standard error alone, so after
-// discovery only its mask command goes to standard output.
+// discovery only its mask command goes to standard output. A call without
+// standard error, such as the version probe, keeps its standard output.
 type stderrOnly struct {
 	*nastoolstest.Fake
 }
 
-func (s stderrOnly) Compose(ctx context.Context, args, env []string, _, errOut io.Writer) error {
+func (s stderrOnly) Compose(ctx context.Context, args, env []string, out, errOut io.Writer) error {
 	if errOut != nil {
 		if _, err := io.WriteString(errOut, tailnetName+"\n"); err != nil {
 			return fmt.Errorf("compose: %w", err)
 		}
+		out = nil
 	}
-	if err := s.Fake.Compose(ctx, args, env, nil, nil); err != nil {
+	if err := s.Fake.Compose(ctx, args, env, out, nil); err != nil {
 		return fmt.Errorf("compose: %w", err)
 	}
 	return nil

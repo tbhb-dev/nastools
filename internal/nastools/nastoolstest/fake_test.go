@@ -122,3 +122,40 @@ func TestFileAPI(t *testing.T) {
 	assert.Equal(t, []string{"read:file.txt", "read:missing.txt", "read:zero"}, f.Calls)
 	assert.Equal(t, []string{"file.txt", "zero", "pipe", "missing.txt"}, f.Opened)
 }
+
+// TestVersionProbe checks the probe's output, environment and error, and
+// that the probe leaves the recording fields empty.
+func TestVersionProbe(t *testing.T) {
+	t.Parallel()
+	probe := []string{"version", "--short"}
+	f := &nastoolstest.Fake{
+		Canaries:    []string{"secret-1.example.invalid"},
+		ComposeErr:  nastoolstest.ErrPrivate,
+		FailCommand: "version",
+	}
+	var out strings.Builder
+	require.NoError(t, f.Compose(t.Context(), probe, []string{"A=1"}, &out, nil))
+	assert.Equal(t, "5.6.1\n", out.String())
+	assert.Equal(t, []string{"A=1"}, f.VersionEnv)
+	assert.Empty(t, f.Calls)
+	assert.Empty(t, f.Commands)
+	assert.Empty(t, f.Environments)
+	assert.Nil(t, f.Args)
+	assert.Nil(t, f.Env)
+
+	f.ComposeVersion = []byte{}
+	out.Reset()
+	require.NoError(t, f.Compose(t.Context(), probe, nil, &out, nil))
+	assert.Empty(t, out.String())
+
+	f.ComposeVersion = []byte("2.23.0\n")
+	f.VersionErr = nastoolstest.ErrPrivate
+	err := f.Compose(t.Context(), probe, nil, &out, nil)
+	require.ErrorIs(t, err, nastoolstest.ErrPrivate)
+	assert.Contains(t, err.Error(), "secret-1.example.invalid")
+	assert.Equal(t, "2.23.0\n", out.String())
+
+	err = f.Compose(t.Context(), probe, nil, &chunks{fail: true}, nil)
+	require.ErrorIs(t, err, nastoolstest.ErrPrivate)
+	assert.Contains(t, err.Error(), "secret-1.example.invalid")
+}
