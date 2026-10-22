@@ -347,7 +347,7 @@ func (o *operations) forwardConnection(ctx context.Context, local net.Conn) {
 func (o *operations) Lock(ctx context.Context, path string) error {
 	stop := context.AfterFunc(ctx, func() { _ = o.client.Close() })
 	defer stop()
-	session, err := o.client.NewSession()
+	session, _, err := openSession(ctx, o.client)
 	if err != nil {
 		return nastools.ErrInvalid
 	}
