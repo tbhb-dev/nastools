@@ -4,6 +4,12 @@
 
 version: "2"
 
+# The end-to-end test in cmd/nastools/e2e_test.go builds only with the e2e
+# tag, so the linters need it to see that file.
+run:
+  build-tags:
+    - e2e
+
 issues:
   max-same-issues: 50
 

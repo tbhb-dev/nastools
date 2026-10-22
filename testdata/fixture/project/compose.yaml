@@ -1,0 +1,16 @@
+---
+# The sample project that the end-to-end test deploys through the SSH
+# engine fixture. The test builds the sample image on the engine first, so
+# neither `compose pull` nor `compose up` fetches an image.
+x-sample: &sample
+  image: ${NASTOOLS_E2E_SAMPLE_IMAGE:?}
+  pull_policy: never
+  init: true
+  environment:
+    READY_DELAY: ${READY_DELAY:-0}
+  labels:
+    example.invalid/commit: ${NASTOOLS_COMMIT:?}
+
+services:
+  web: *sample
+  worker: *sample
