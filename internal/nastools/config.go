@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"net/url"
 	"os"
@@ -129,8 +130,15 @@ func resolve(dir, path string) string {
 	return filepath.Join(dir, path)
 }
 
+// Files opens deployment inputs. ReadInput reads through it.
+type Files interface {
+	Stat(path string) (fs.FileInfo, error)
+	OpenFile(path string) (io.ReadCloser, error)
+}
+
 // Operations supplies effects used by the policy.
 type Operations interface {
+	Files
 	ReadFile(path string) ([]byte, error)
 	GitState(ctx context.Context, dir string) (GitState, error)
 	Compose(ctx context.Context, args, env []string, out, errOut io.Writer) error

@@ -93,7 +93,8 @@ func TestInactivePassesThrough(t *testing.T) {
 func TestMasksAndRedactsDerivedForms(t *testing.T) {
 	t.Parallel()
 	g, log := gate(0)
-	g.Add(secret, "secret-2.example.invalid:22", knownHosts, "", "  ", secret, "%\r%")
+	g.Add(secret, "", "  ", secret, "%\r%")
+	g.AddHosts("secret-2.example.invalid:22", knownHosts)
 	_, err := io.WriteString(
 		g.Stderr(),
 		"a secret-1.example.invalid b\nsecret-2.example.invalid secret-4.example.invalid",
@@ -104,6 +105,7 @@ func TestMasksAndRedactsDerivedForms(t *testing.T) {
 	require.NoError(t, g.Close())
 	line := func(i int) string { return strings.TrimSpace(strings.Split(knownHosts, "\n")[i]) }
 	assert.Equal(t, maskPrefix+secret+"\n"+
+		maskPrefix+"%25%0D%25\n"+
 		maskPrefix+"secret-2.example.invalid:22\n"+
 		maskPrefix+"secret-2.example.invalid\n"+
 		maskPrefix+strings.ReplaceAll(strings.TrimSuffix(knownHosts, "\n"), "\n", "%0A")+"\n"+
@@ -111,24 +113,41 @@ func TestMasksAndRedactsDerivedForms(t *testing.T) {
 		maskPrefix+"secret-4.example.invalid\n"+
 		maskPrefix+line(1)+"\n"+
 		maskPrefix+"secret-5.example.invalid\n"+
-		maskPrefix+"%25%0D%25\n"+
 		"c ***\npartial", text(*log, "out"))
 	assert.Equal(t, "a *** b\n*** ***", text(*log, "err"))
 }
 
 func TestTailnetNameMaskedBeforeItsLine(t *testing.T) {
 	t.Parallel()
+	for _, name := range []string{tailnet, "NODE.EXAMPLE.TS.NET", "Node.Example.Ts.Net"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			g, log := gate(0)
+			_, err := io.WriteString(g.Stderr(), "serving https://"+name+":443\n")
+			require.NoError(t, err)
+			_, err = io.WriteString(g.Stdout(), name+"\n")
+			require.NoError(t, err)
+			require.NoError(t, g.Close())
+			assert.Equal(t, []entry{
+				{"out", maskPrefix + name + "\n"},
+				{"err", "serving https://***:443\n"},
+				{"out", "***\n"},
+			}, *log)
+		})
+	}
+}
+
+// TestHostFormsOnlyForHosts checks that only an address or known-hosts
+// value yields host names, so a static file line keeps its words.
+func TestHostFormsOnlyForHosts(t *testing.T) {
+	t.Parallel()
 	g, log := gate(0)
-	_, err := io.WriteString(g.Stderr(), "serving https://"+tailnet+":443\n")
-	require.NoError(t, err)
-	_, err = io.WriteString(g.Stdout(), tailnet+"\n")
+	g.Add("services: web", "hostname:8080", "secret-4.example.invalid ssh-ed25519 AAAA")
+	g.AddHosts("secret-2.example.invalid:22")
+	_, err := io.WriteString(g.Stderr(), "services hostname secret-4.example.invalid secret-2.example.invalid\n")
 	require.NoError(t, err)
 	require.NoError(t, g.Close())
-	assert.Equal(t, []entry{
-		{"out", maskPrefix + tailnet + "\n"},
-		{"err", "serving https://***:443\n"},
-		{"out", "***\n"},
-	}, *log)
+	assert.Equal(t, "services hostname secret-4.example.invalid ***\n", text(*log, "err"))
 }
 
 func TestReplacementCannotExposeAName(t *testing.T) {
@@ -155,13 +174,15 @@ func TestOverlappingValues(t *testing.T) {
 func TestTrailingNewlineValue(t *testing.T) {
 	t.Parallel()
 	g, log := gate(0)
-	g.Add("abc1234\n", "def5678\r\n", "first-line\nx\n")
-	_, err := io.WriteString(g.Stderr(), "abc1234 def5678 first-line x\n")
+	// Only the first two values are multi-line once their blank lines go.
+	g.Add("abc1234\n", "def5678\r\n", "first-line\nx\n", "\npass123", "word456\n \n", " \r\n\tkey789\n\n", "\n \n")
+	_, err := io.WriteString(g.Stderr(), "abc1234 def5678 first-line x pass123 word456 \tkey789\n")
 	require.NoError(t, err)
 	require.NoError(t, g.Close())
 	assert.Equal(t, maskPrefix+"abc1234\n"+maskPrefix+"def5678\n"+
-		maskPrefix+"first-line%0Ax\n"+maskPrefix+"first-line\n", text(*log, "out"))
-	assert.Equal(t, "*** *** *** x\n", text(*log, "err"))
+		maskPrefix+"first-line%0Ax\n"+maskPrefix+"first-line\n"+
+		maskPrefix+"pass123\n"+maskPrefix+"word456\n"+maskPrefix+"\tkey789\n", text(*log, "out"))
+	assert.Equal(t, "*** *** *** x *** *** ***\n", text(*log, "err"))
 }
 
 func TestCloseReportsFlushMaskFailure(t *testing.T) {
@@ -206,24 +227,73 @@ func TestMaskFailureIsSticky(t *testing.T) {
 	}
 }
 
+// TestLongLineCut checks that a cut never splits a value or a host name,
+// and holds back the start of a value that hasn't fully arrived.
 func TestLongLineCut(t *testing.T) {
 	t.Parallel()
-	for _, value := range []string{secret, tailnet} {
-		t.Run(value, func(t *testing.T) {
+	filler := strings.Repeat("_", 64<<10)
+	a, b := strings.Repeat("a", 300), "a"+strings.Repeat("b", 299)
+	for _, tc := range []struct {
+		name    string
+		secrets []string
+		writes  []string
+		first   string // Standard error after the first write.
+		want    string
+	}{
+		// The default cut point falls inside the value or the name.
+		{
+			"value",
+			[]string{secret},
+			[]string{filler + secret + strings.Repeat("_", 243), ""},
+			filler,
+			filler + "***" + strings.Repeat("_", 243),
+		},
+		{
+			"name", nil,
+			[]string{filler + tailnet + strings.Repeat("_", 243), ""},
+			filler,
+			filler + "***" + strings.Repeat("_", 243),
+		},
+		// b overlaps the end of a and arrives only in part before the cut.
+		{"overlap", []string{a, b}, []string{filler + a + b[1:101], b[101:] + "\n"}, filler, filler + "***\n"},
+		{
+			"overlap, one write",
+			[]string{a, b},
+			[]string{filler + a + b[1:] + "\n"},
+			filler + "***\n",
+			filler + "***\n",
+		},
+		{"repeated", []string{a}, []string{filler + strings.Repeat("a", 450), "x\n"}, filler, filler + "***x\n"},
+		// A run of host bytes too long for a name is cut within it, but not
+		// within a value.
+		{
+			"host run",
+			[]string{secret},
+			[]string{"x" + secret + strings.Repeat("y", 70<<10), "\n"},
+			"x***" + strings.Repeat("y", 70<<10-253), "x***" + strings.Repeat("y", 70<<10) + "\n",
+		},
+		{
+			"host run, value at the cut",
+			[]string{secret},
+			[]string{strings.Repeat("y", 64<<10) + secret + strings.Repeat("y", 240), "\n"},
+			strings.Repeat("y", 64<<10), strings.Repeat("y", 64<<10) + "***" + strings.Repeat("y", 240) + "\n",
+		},
+		// Nothing outside the covered run can be cut. The line waits for its end.
+		{"held", []string{strings.Repeat("ab", 4)}, []string{strings.Repeat("ab", 40<<10), "ab", "\n"}, "", "***\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			g, log := gate(0)
-			g.Add(secret)
-			// The default cut point falls inside value.
-			prefix, suffix := strings.Repeat("_", 64<<10), strings.Repeat("_", 243)
-			_, err := io.WriteString(g.Stderr(), prefix+value+suffix)
-			require.NoError(t, err)
-			assert.Equal(t, prefix+"***", text(*log, "err"))
-			_, err = io.WriteString(g.Stdout(), prefix+value+suffix+"\n")
-			require.NoError(t, err)
+			g.Add(tc.secrets...)
+			for i, write := range tc.writes {
+				_, err := io.WriteString(g.Stderr(), write)
+				require.NoError(t, err)
+				if i == 0 {
+					assert.Equal(t, tc.first, text(*log, "err"))
+				}
+			}
 			require.NoError(t, g.Close())
-			want := prefix + "***" + suffix
-			assert.Equal(t, want, text(*log, "err"))
-			assert.True(t, strings.HasSuffix(text(*log, "out"), want+"\n"))
+			assert.Equal(t, tc.want, text(*log, "err"))
 		})
 	}
 }
@@ -300,7 +370,8 @@ func run(t *testing.T, secrets []string, input string, splits []byte) []entry {
 }
 
 // FuzzGate builds two secrets that overlap by overlap bytes, a+b[:overlap]
-// and b, and checks a line holding a+b besides the fuzzed input.
+// and b, and checks a line holding a+b besides the fuzzed input. With long
+// set, the line starts with enough filler that a+b crosses the cut point.
 func FuzzGate(f *testing.F) {
 	f.Add(
 		secret,
@@ -308,24 +379,39 @@ func FuzzGate(f *testing.F) {
 		"a "+secret+" b\n"+tailnet+"\nsecret-2.example.invalid",
 		[]byte{0, 4, 2},
 		uint8(0),
+		false,
 	)
-	f.Add("over", "lapping", "an overlapping one\n", []byte{2}, uint8(3))
-	f.Add("prefix-node", "x", "prefix-node.example.ts.net prefix-nodes.example.ts.net\n\n", []byte{6, 0}, uint8(1))
-	f.Add("%", "\r", "100%\r\n", []byte{}, uint8(0))
-	f.Fuzz(func(t *testing.T, a, b, input string, splits []byte, overlap uint8) {
+	f.Add("over", "lapping", "an overlapping one\n", []byte{2}, uint8(3), false)
+	f.Add(
+		"prefix-node",
+		"x",
+		"prefix-node.example.ts.net prefix-nodes.example.ts.net\n\n",
+		[]byte{6, 0},
+		uint8(1),
+		false,
+	)
+	f.Add("%", "\r", "100%\r\n", []byte{}, uint8(0), false)
+	f.Add(strings.Repeat("a", 299), "a"+strings.Repeat("b", 299), "", []byte{99, 199}, uint8(1), true)
+	f.Add(
+		strings.Repeat("ab", 150),
+		strings.Repeat("ab", 150),
+		"NODE.EXAMPLE.TS.NET\n",
+		[]byte{255, 7},
+		uint8(200),
+		true,
+	)
+	f.Add("x.example.ts.net", strings.Repeat("y", 280)+".example.ts.net", "", []byte{254, 3}, uint8(0), true)
+	f.Fuzz(func(t *testing.T, a, b, input string, splits []byte, overlap uint8, long bool) {
 		if len(input) > 4096 {
 			t.Skip("long lines have their own test")
 		}
-		var secrets []string
-		for _, value := range []string{a + b[:int(overlap)%(len(b)+1)], b} {
-			// The gate drops a trailing carriage return, which the line check
-			// below would then find uncovered.
-			if !strings.ContainsAny(value, "*\n") && !strings.HasSuffix(value, "\r") && strings.TrimSpace(value) != "" {
-				secrets = append(secrets, value)
-			}
+		secrets := fuzzSecrets(a+b[:int(overlap)%(len(b)+1)], b)
+		filler := ""
+		if long {
+			filler = strings.Repeat("_", 64<<10)
 		}
-		if len(secrets) == 2 {
-			input = a + b + "\n" + input
+		if len(secrets) == 2 || long {
+			input = filler + a + b + "\n" + input
 		}
 		whole := run(t, secrets, input, nil)
 		chunked := run(t, secrets, input, append(splits, 0))
@@ -336,9 +422,26 @@ func FuzzGate(f *testing.F) {
 		if len(secrets) == 2 {
 			// The secrets cover the whole line between them.
 			first, _, _ := strings.Cut(text(whole, "err"), "\n")
-			assert.Equal(t, placeholder, first)
+			if long {
+				assert.True(t, strings.HasSuffix(first, placeholder))
+			} else {
+				assert.Equal(t, placeholder, first)
+			}
 		}
 	})
+}
+
+// fuzzSecrets keeps the values that the gate registers unchanged as one line.
+func fuzzSecrets(values ...string) []string {
+	var secrets []string
+	for _, value := range values {
+		// The gate drops a trailing carriage return, which the line check
+		// would then find uncovered.
+		if !strings.ContainsAny(value, "*\n") && !strings.HasSuffix(value, "\r") && strings.TrimSpace(value) != "" {
+			secrets = append(secrets, value)
+		}
+	}
+	return secrets
 }
 
 // assertNoSurvivors checks every output line outside a mask command.

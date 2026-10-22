@@ -176,7 +176,8 @@ linters:
     # Process output passes the redact gate. Only cmd/nastools/main.go holds
     # the process streams; see the exclusion rule below. Type analysis
     # matches package names, so an import alias doesn't hide a call.
-    # internal/redact/guard_test.go rejects the device paths of the streams.
+    # internal/redact/guard_test.go repeats these checks with the AST and
+    # rejects device paths.
     forbidigo:
       analyze-types: true
       forbid:
@@ -184,7 +185,21 @@ linters:
           msg: write through the gate's writers instead
         - pattern: ^(fmt\.Print(f|ln)?|log\.(Print|Fatal|Panic)(f|ln)?|print|println)$
           msg: write through the gate's writers instead
-        - pattern: ^syscall\.(Stdout|Stderr|Write)$
+        # Forbidding log.Default also covers its methods, such as
+        # log.Default().Println.
+        - pattern: ^log\.(Default|Output|Writer)$
+          pkg: ^log$
+          msg: the default logger writes to standard error; write through the gate's writers instead
+        - pattern: ^debug\.PrintStack$
+          pkg: ^runtime/debug$
+          msg: PrintStack writes to standard error; write through the gate's writers instead
+        - pattern: ^syscall\.(Stdout|Stderr|Write|Pwrite|Syscall|Syscall6|Syscall9|RawSyscall|RawSyscall6)$
+          msg: write through the gate's writers instead
+        - pattern: ^unix\.(Stdout|Stderr|Write|Writev|Pwrite|Pwritev)$
+          pkg: ^golang\.org/x/sys/unix$
+          msg: write through the gate's writers instead
+        - pattern: ^unix\.(Raw)?Syscall(6|9|NoError)?$
+          pkg: ^golang\.org/x/sys/unix$
           msg: write through the gate's writers instead
         - pattern: ^slog\.(Debug|Info|Warn|Error|Log|LogAttrs|Default)(Context)?$
           pkg: ^log/slog$

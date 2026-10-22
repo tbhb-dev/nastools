@@ -5,6 +5,8 @@ package nastoolstest_test
 
 import (
 	"errors"
+	"io"
+	"io/fs"
 	"strings"
 	"testing"
 
@@ -90,4 +92,33 @@ func TestWriteFailuresCarryCanaries(t *testing.T) {
 		require.ErrorIs(t, err, nastoolstest.ErrPrivate)
 		assert.Contains(t, err.Error(), "secret-1.example.invalid")
 	}
+}
+
+func TestFileAPI(t *testing.T) {
+	t.Parallel()
+	f := &nastoolstest.Fake{
+		Files:   map[string]string{"file.txt": "example"},
+		Streams: map[string]fs.FileMode{"zero": fs.ModeDevice, "pipe": fs.ModeNamedPipe},
+	}
+	data, err := f.ReadFile("file.txt")
+	require.NoError(t, err)
+	assert.Equal(t, "example", string(data))
+	_, err = f.ReadFile("missing.txt")
+	require.ErrorIs(t, err, nastoolstest.ErrPrivate)
+	info, err := f.Stat("zero")
+	require.NoError(t, err)
+	assert.Equal(t, fs.ModeDevice, info.Mode())
+	zero, err := f.OpenFile("zero")
+	require.NoError(t, err)
+	buf := []byte("xyz")
+	n, err := io.ReadFull(zero, buf)
+	require.NoError(t, err)
+	assert.Equal(t, []byte{0, 0, 0}, buf[:n])
+	require.NoError(t, zero.Close())
+	_, err = f.OpenFile("pipe")
+	require.Error(t, err)
+	_, err = f.OpenFile("missing.txt")
+	require.ErrorIs(t, err, nastoolstest.ErrPrivate)
+	assert.Equal(t, []string{"read:file.txt", "read:missing.txt", "read:zero"}, f.Calls)
+	assert.Equal(t, []string{"file.txt", "zero", "pipe", "missing.txt"}, f.Opened)
 }

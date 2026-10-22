@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"slices"
 	"strings"
 
@@ -19,11 +20,17 @@ import (
 // ErrPrivate is a fake adapter diagnostic with a private value in its text.
 var ErrPrivate = errors.New("private.example.invalid")
 
+// errBlocked replaces an open that would block on a named pipe.
+var errBlocked = errors.New("open blocks on a named pipe")
+
 // Fake records every call. With Canaries set, Compose and Remote write each
 // canary to both writers in odd chunk sizes, and every injected error's text
 // carries the canaries.
 type Fake struct {
-	Files        map[string]string
+	Files map[string]string
+	// Streams maps a path to its mode, for a file whose content never ends,
+	// such as /dev/zero. Opening a named pipe fails, where a real one blocks.
+	Streams      map[string]fs.FileMode
 	State        nastools.GitState
 	GitErr       error
 	ComposeErr   error
@@ -38,6 +45,7 @@ type Fake struct {
 	Canaries     []string
 
 	Calls        []string
+	Opened       []string
 	Args         []string
 	Env          []string
 	Out          bytes.Buffer
@@ -77,13 +85,55 @@ func (f *Fake) leak(writers ...io.Writer) error {
 }
 
 func (f *Fake) ReadFile(path string) ([]byte, error) {
+	data, err := nastools.ReadInput(f, path)
+	if err != nil {
+		return nil, fmt.Errorf("read: %w", err)
+	}
+	return data, nil
+}
+
+// Stat records the start of a read as ReadFile does.
+func (f *Fake) Stat(path string) (fs.FileInfo, error) {
 	f.Calls = append(f.Calls, "read:"+path)
+	if mode, ok := f.Streams[path]; ok {
+		return fileInfo{mode: mode}, nil
+	}
+	if _, ok := f.Files[path]; !ok {
+		return nil, f.fail(ErrPrivate)
+	}
+	return fileInfo{}, nil
+}
+
+func (f *Fake) OpenFile(path string) (io.ReadCloser, error) {
+	f.Opened = append(f.Opened, path)
+	if mode, ok := f.Streams[path]; ok {
+		if mode&fs.ModeNamedPipe != 0 {
+			return nil, errBlocked
+		}
+		return io.NopCloser(zeros{}), nil
+	}
 	data, ok := f.Files[path]
 	if !ok {
 		return nil, f.fail(ErrPrivate)
 	}
-	return []byte(data), nil
+	return io.NopCloser(strings.NewReader(data)), nil
 }
+
+type zeros struct{}
+
+func (zeros) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
+// fileInfo reports only the mode, which ReadInput checks.
+type fileInfo struct {
+	fs.FileInfo
+
+	mode fs.FileMode
+}
+
+func (i fileInfo) Mode() fs.FileMode { return i.mode }
 
 func (f *Fake) GitState(context.Context, string) (nastools.GitState, error) {
 	f.Calls = append(f.Calls, "git")

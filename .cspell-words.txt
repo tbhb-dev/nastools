@@ -53,3 +53,4 @@ nolint
 stretchr
 nastoolstest
 tailnet
+Pwritev

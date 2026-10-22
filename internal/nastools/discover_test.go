@@ -4,6 +4,7 @@
 package nastools_test
 
 import (
+	"io/fs"
 	"maps"
 	"slices"
 	"strings"
@@ -44,7 +45,8 @@ func discoverFiles(config string) map[string]string {
 
 func discover(files, env map[string]string) []string {
 	f := &nastoolstest.Fake{Files: files}
-	return nastools.Discover(f.ReadFile, "deployment/nastools.toml", env)
+	private := nastools.Discover(f.ReadFile, "deployment/nastools.toml", env)
+	return slices.Concat(private.Values, private.Hosts)
 }
 
 // TestDiscoverSuperset checks that Discover finds every value whose absence
@@ -256,4 +258,78 @@ func TestCachedReadsOnce(t *testing.T) {
 		require.ErrorIs(t, err, nastoolstest.ErrPrivate)
 	}
 	assert.Equal(t, []string{"read:nastools.toml", "read:missing.toml"}, f.Calls)
+}
+
+// TestDiscoverHosts checks that only the address and known-hosts values
+// count as hosts, unless the config fails to parse.
+func TestDiscoverHosts(t *testing.T) {
+	t.Parallel()
+	config := discoverBase + "required_env = [\"REQUIRED_INPUT\"]\n[ssh]\naddress_env = \"SSH_ADDRESS\"\n" +
+		"user_env = \"SSH_USER\"\nknown_hosts_env = \"SSH_KNOWN_HOSTS\"\n[files]\nSTATIC_INPUT = \"static.txt\"\n"
+	env := discoverEnv()
+	f := &nastoolstest.Fake{Files: discoverFiles(config)}
+	private := nastools.Discover(f.ReadFile, "deployment/nastools.toml", env)
+	assert.Equal(t, []string{env["SSH_ADDRESS"], env["SSH_KNOWN_HOSTS"]}, private.Hosts)
+	assert.Equal(t, []string{"", env["REQUIRED_INPUT"], env["SSH_USER"], "secret-7.example.invalid"}, private.Values)
+
+	f = &nastoolstest.Fake{Files: discoverFiles("project = = 'x'\n" + config)}
+	private = nastools.Discover(f.ReadFile, "deployment/nastools.toml", env)
+	assert.Equal(t, []string{env["REQUIRED_INPUT"], env["SSH_ADDRESS"], env["SSH_USER"], env["SSH_KNOWN_HOSTS"]},
+		private.Hosts)
+}
+
+// TestDiscoverBoundedReads checks that discovery skips a named pipe and a
+// device without opening them, and drops a file over the size limit, read
+// only to its limit. The strict path then finds each input unreadable.
+func TestDiscoverBoundedReads(t *testing.T) {
+	t.Parallel()
+	big := strings.Repeat("secret-8.example.invalid\n", 1<<20/25+1)
+	config := discoverBase + "[files]\nZERO = \"zero\"\nPIPE = \"pipe\"\nBIG = \"big.txt\"\n" +
+		"STATIC_INPUT = \"static.txt\"\n[expand_files]\nENDLESS = \"endless\"\n"
+	for name, path := range map[string]string{
+		"zero": "deployment/zero", "pipe": "deployment/pipe", "big": "deployment/big.txt",
+		"endless": "deployment/endless", "config": "deployment/nastools.toml",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			files := discoverFiles(config)
+			files["deployment/big.txt"] = big
+			f := &nastoolstest.Fake{Files: files, Streams: map[string]fs.FileMode{
+				"deployment/zero":    fs.ModeDevice | fs.ModeCharDevice,
+				"deployment/pipe":    fs.ModeNamedPipe,
+				"deployment/endless": 0,
+			}}
+			if name == "config" {
+				f.Streams[path] = fs.ModeNamedPipe
+			}
+			ops := nastools.Cached(f)
+			private := nastools.Discover(ops.ReadFile, "deployment/nastools.toml", discoverEnv())
+			if name == "config" {
+				assert.Equal(t, nastools.Private{Values: []string{""}}, private)
+				assert.False(t, nastools.Parses(ops.ReadFile, path))
+			} else {
+				assert.Contains(t, private.Values, "secret-7.example.invalid")
+			}
+			assert.NotContains(t, private.Values, "secret-8.example.invalid")
+			assert.NotContains(t, f.Opened, "deployment/zero")
+			assert.NotContains(t, f.Opened, "deployment/pipe")
+			_, err := ops.ReadFile(path)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestReadInputLimit(t *testing.T) {
+	t.Parallel()
+	f := &nastoolstest.Fake{Files: map[string]string{
+		"limit.txt": strings.Repeat("x", 1<<20),
+		"over.txt":  strings.Repeat("x", 1<<20+1),
+	}}
+	data, err := nastools.ReadInput(f, "limit.txt")
+	require.NoError(t, err)
+	assert.Len(t, data, 1<<20)
+	_, err = nastools.ReadInput(f, "over.txt")
+	require.Error(t, err)
+	_, err = nastools.ReadInput(f, "missing.txt")
+	require.ErrorIs(t, err, nastoolstest.ErrPrivate)
 }

@@ -20,8 +20,8 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// TailnetName matches a MagicDNS host name.
-var TailnetName = regexp.MustCompile(`[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.ts\.net`)
+// TailnetName matches a MagicDNS host name in any case, as DNS compares names.
+var TailnetName = regexp.MustCompile(`(?i)[a-z0-9-]+(\.[a-z0-9-]+)*\.ts\.net`)
 
 const (
 	// A derived form shorter than this would redact common text everywhere.
@@ -29,7 +29,9 @@ const (
 	// A line without a newline is cut once it grows past this many bytes.
 	maxLine = 64 << 10
 	// The tail kept after a cut has room for a whole DNS name.
-	maxHost     = 253
+	maxHost = 253
+	// After a failed cut, the line must double before the next try.
+	heldGrowth  = 2
 	placeholder = "***"
 )
 
@@ -50,10 +52,12 @@ type stream struct {
 	w       io.Writer
 	pending []byte
 	open    bool // The last byte written wasn't a newline.
+	held    int  // Pending length at which the next cut runs, after one failed.
 }
 
 // New returns a gate over the process streams. An inactive gate passes the
-// writers through unchanged.
+// writers through unchanged. Each pattern matches host names, so only
+// letters, digits, hyphens, and dots.
 func New(stdout, stderr io.Writer, active bool, patterns ...*regexp.Regexp) *Gate {
 	g := &Gate{active: active, masked: make(map[string]bool), patterns: patterns}
 	g.stdout = &stream{gate: g, w: stdout}
@@ -62,14 +66,19 @@ func New(stdout, stderr io.Writer, active bool, patterns ...*regexp.Regexp) *Gat
 }
 
 // Add masks each value at once and redacts it from later output.
-func (g *Gate) Add(values ...string) {
+func (g *Gate) Add(values ...string) { g.add(values, false) }
+
+// AddHosts adds address and known-hosts values, with the host names in them.
+func (g *Gate) AddHosts(values ...string) { g.add(values, true) }
+
+func (g *Gate) add(values []string, hosts bool) {
 	if !g.active {
 		return
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for _, value := range values {
-		g.register(value, false)
+		g.register(value, false, hosts)
 	}
 }
 
@@ -111,10 +120,10 @@ func (g *Gate) Close() error {
 	return errors.Join(append(errs, g.err)...)
 }
 
-// register adds a value without its trailing newlines. A value then counts
-// as multi-line only for a newline within it.
-func (g *Gate) register(value string, derived bool) {
-	value = strings.TrimRight(value, "\r\n")
+// register adds a value without its blank first and last lines. A value
+// then counts as multi-line only for a newline between two of its lines.
+func (g *Gate) register(value string, derived, hosts bool) {
+	value = trimBlankLines(value)
 	if strings.TrimSpace(value) == "" || g.masked[value] || (derived && len(value) < minDerived) {
 		return
 	}
@@ -126,19 +135,43 @@ func (g *Gate) register(value string, derived bool) {
 		})
 	}
 	g.mask(value)
-	for _, form := range derivedForms(value) {
-		g.register(form, true)
+	for _, form := range derivedForms(value, hosts) {
+		g.register(form, true, hosts)
 	}
 }
 
-// derivedForms lists the lines of a multi-line value, the host part of an
-// address, and the host fields of a known-hosts line.
-func derivedForms(value string) []string {
+// trimBlankLines drops the whitespace-only lines at either end of value,
+// and the carriage return that ends its last line.
+func trimBlankLines(value string) string {
+	for {
+		line, rest, found := strings.Cut(value, "\n")
+		if !found || strings.TrimSpace(line) != "" {
+			break
+		}
+		value = rest
+	}
+	for {
+		i := strings.LastIndexByte(value, '\n')
+		if i < 0 || strings.TrimSpace(value[i+1:]) != "" {
+			break
+		}
+		value = value[:i]
+	}
+	return strings.TrimRight(value, "\r")
+}
+
+// derivedForms lists the lines of a multi-line value. For an address or
+// known-hosts value, it adds the host part of an address and the host fields
+// of a known-hosts line.
+func derivedForms(value string, hosts bool) []string {
 	var forms []string
 	if strings.Contains(value, "\n") {
 		for line := range strings.Lines(value) {
 			forms = append(forms, strings.TrimSpace(line))
 		}
+	}
+	if !hosts {
+		return forms
 	}
 	if host, _, err := net.SplitHostPort(value); err == nil {
 		forms = append(forms, host)
@@ -177,7 +210,7 @@ func (g *Gate) redact(line string) string {
 		found := false
 		for _, pattern := range g.patterns {
 			for _, match := range pattern.FindAllString(line, -1) {
-				g.register(match, false)
+				g.register(match, false, false)
 				found = true
 			}
 		}
@@ -191,6 +224,21 @@ func (g *Gate) redact(line string) string {
 // replace swaps each run of bytes that any known value covers for one
 // placeholder. Values that overlap then don't leave part of either behind.
 func (g *Gate) replace(line string) string {
+	covered := g.cover(line)
+	var b strings.Builder
+	for i := range len(line) {
+		switch {
+		case !covered[i]:
+			b.WriteByte(line[i])
+		case i == 0 || !covered[i-1]:
+			b.WriteString(placeholder)
+		}
+	}
+	return b.String()
+}
+
+// cover marks each byte of line that a known value covers.
+func (g *Gate) cover(line string) []bool {
 	covered := make([]bool, len(line))
 	for _, secret := range g.secrets {
 		for start := 0; ; start++ {
@@ -204,53 +252,46 @@ func (g *Gate) replace(line string) string {
 			}
 		}
 	}
-	var b strings.Builder
-	for i := range len(line) {
-		switch {
-		case !covered[i]:
-			b.WriteByte(line[i])
-		case i == 0 || !covered[i-1]:
-			b.WriteString(placeholder)
-		}
-	}
-	return b.String()
+	return covered
 }
 
-// cut returns where to split a long line: before the tail that could hold the
-// start of a value, and past any value or match that crosses that point.
+// cut returns where to split a long line, or 0 to buffer the whole line.
+// The split keeps back room for all but one byte of the longest value and
+// for a whole DNS name, so every value that starts before it has arrived.
+// It then moves back past every byte that a value or a match covers, so
+// none crosses it and a placeholder never splits in two. It prefers a byte
+// that can't be part of a host name, because a match can't extend across
+// one. A split within a longer run of host bytes can only cross a name too
+// long for DNS. A line that one covered run fills waits until the run ends.
 func (g *Gate) cut(data []byte) int {
 	keep := maxHost
 	if len(g.secrets) > 0 {
 		keep = max(keep, len(g.secrets[0])-1)
 	}
-	end := len(data) - keep
-	for end > 0 {
-		next := g.past(data, end)
-		if next == end {
-			break
-		}
-		end = next
-	}
-	return end
-}
-
-// past returns the end of the first value or match that crosses end, or end.
-func (g *Gate) past(data []byte, end int) int {
-	for _, secret := range g.secrets {
-		lo := max(0, end-len(secret)+1)
-		i := bytes.Index(data[lo:min(len(data), end+len(secret)-1)], []byte(secret))
-		if i >= 0 && lo+i < end {
-			return lo + i + len(secret)
-		}
-	}
+	line := string(data)
+	covered := g.cover(line)
 	for _, pattern := range g.patterns {
-		for _, loc := range pattern.FindAllIndex(data, -1) {
-			if loc[0] < end && end < loc[1] {
-				return loc[1]
+		for _, loc := range pattern.FindAllStringIndex(line, -1) {
+			for i := loc[0]; i < loc[1]; i++ {
+				covered[i] = true
 			}
 		}
 	}
-	return end
+	fallback := 0
+	for end := len(data) - keep; end > 0; end-- {
+		switch {
+		case covered[end-1]:
+		case !hostByte(data[end-1]) || !hostByte(data[end]):
+			return end
+		case fallback == 0:
+			fallback = end
+		}
+	}
+	return fallback
+}
+
+func hostByte(c byte) bool {
+	return c == '-' || c == '.' || '0' <= c && c <= '9' || 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z'
 }
 
 // Write emits each complete line redacted. It reports len(p) for buffered bytes.
@@ -264,12 +305,15 @@ func (s *stream) Write(p []byte) (int, error) {
 	s.pending = append(s.pending, p...)
 	for {
 		end := bytes.IndexByte(s.pending, '\n') + 1
-		if end == 0 && len(s.pending) > maxLine {
-			end = g.cut(s.pending)
+		if end == 0 && len(s.pending) > max(maxLine, s.held) {
+			if end = g.cut(s.pending); end == 0 {
+				s.held = heldGrowth * len(s.pending)
+			}
 		}
 		if end <= 0 {
 			return len(p), nil
 		}
+		s.held = 0
 		if err := s.emit(end); err != nil {
 			return 0, err
 		}
