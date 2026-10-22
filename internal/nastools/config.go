@@ -81,7 +81,7 @@ func (c Config) validate() error {
 	if !regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`).MatchString(c.Project) {
 		return fmt.Errorf("project: %w", ErrInvalid)
 	}
-	if !filepath.IsAbs(*c.SSH.LockDir) {
+	if c.SSH.LockDir == nil || !filepath.IsAbs(*c.SSH.LockDir) {
 		return fmt.Errorf("ssh.lock_dir: %w", ErrInvalid)
 	}
 	if len(c.Compose) == 0 {
