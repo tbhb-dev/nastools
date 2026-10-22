@@ -51,7 +51,7 @@ Redaction doesn't cover:
 - Go runtime diagnostics that `GODEBUG` turns on, which also write past the redacting writers. The resolver setting `netdns=2`, or its `go+2` and `cgo+2` forms, prints the SSH host name to standard error. Leave `GODEBUG` unset in the step.
 - The step's `env:` block, which the runner prints before nastools starts. Pass private values through `secrets.*`, not `vars.*`.
 - Standard output that doesn't reach the runner. Under GitHub Actions, standard output carries each private value inside its `::add-mask::` line. Redirecting it to a file, or through `tee` to a file that a later step uploads as an artifact, exposes every value. Leave the standard output of nastools connected to the runner.
-- Short values: lines under eight bytes within a multi-line value or a `[files]` file, and host names that short. nastools replaces a short value of its own wherever it appears. The trimmed form of a single-line value with surrounding spaces or tabs follows the same eight-character floor, so nastools redacts a padded value whose trimmed form is under eight characters only in its padded form.
+- Short values: lines under eight bytes within a multi-line value or a `[files]` file, and host names that short. nastools replaces a short value of its own wherever it appears. The trimmed form of a single-line value with surrounding spaces or tabs follows the same eight-byte floor, so nastools redacts a padded value whose trimmed form is under eight bytes only in its padded form.
 - Application output in `logs`, beyond the known values.
 
 Git state supplies the commit label, with `-dirty` for modified or new files.
