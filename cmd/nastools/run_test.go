@@ -88,14 +88,18 @@ func TestVersionWriteFailure(t *testing.T) {
 type unreadableConfigOperations struct {
 	nastools.Operations
 
-	path string
-	data []byte
+	path  string
+	data  []byte
+	files map[string]string
 }
 
 var errPrivateConfig = errors.New("private.example.invalid")
 
 func (f *unreadableConfigOperations) ReadFile(path string) ([]byte, error) {
 	f.path = path
+	if data, ok := f.files[path]; ok {
+		return []byte(data), nil
+	}
 	if f.data != nil {
 		return f.data, nil
 	}
@@ -223,5 +227,40 @@ known_hosts_env = "KNOWN_HOSTS"
 				}
 			})
 		}
+	}
+}
+
+func TestRemoteFlagErrorsMaskTemplateReferences(t *testing.T) {
+	t.Parallel()
+	for _, args := range [][]string{
+		{"deploy", "--lock-wait", "invalid"},
+		{"status", "extra"},
+		{"logs", "--help"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			t.Parallel()
+			var out bytes.Buffer
+			f := &unreadableConfigOperations{files: map[string]string{
+				"nastools.toml": `required_env = ["REQUIRED"]
+[ssh]
+address_env = "ADDRESS"
+user_env = "USER"
+known_hosts_env = "KNOWN_HOSTS"
+[expand_files]
+EXPANDED = "template.txt"
+`,
+				"template.txt": "${TEMPLATE_ONLY}",
+			}}
+			Run(t.Context(), args, streams{out: &out, err: &out}, f, map[string]string{
+				"GITHUB_ACTIONS": "true", "REQUIRED": "required.example.invalid",
+				"ADDRESS": "nas.example.invalid:22", "USER": "user.example.invalid",
+				"KNOWN_HOSTS": "key.example.invalid", "TEMPLATE_ONLY": "template.example.invalid",
+			})
+			masks := "::add-mask::key.example.invalid\n::add-mask::nas.example.invalid:22\n" +
+				"::add-mask::required.example.invalid\n::add-mask::user.example.invalid\n" +
+				"::add-mask::template.example.invalid\n"
+			assert.True(t, strings.HasPrefix(out.String(), masks))
+			assert.NotContains(t, strings.TrimPrefix(out.String(), masks), "template.example.invalid")
+		})
 	}
 }

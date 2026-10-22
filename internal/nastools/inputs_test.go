@@ -41,6 +41,10 @@ type fakeOperations struct {
 	remotes         [][]string
 	remoteStatus    string
 	remoteFail      string
+	remoteOut       string
+	remoteDiag      string
+	lockBlock       bool
+	onPause         func()
 	closed          int
 }
 
@@ -338,7 +342,64 @@ func TestExpansionFailureOrder(t *testing.T) {
 	f := &fakeOperations{files: map[string]string{"a.txt": "$MISSING"}}
 	_, err := nastools.Prepare(t.Context(), f, "nastools.toml", c, environment())
 	require.ErrorContains(t, err, "expand_files.A_INPUT")
-	assert.Equal(t, []string{"read:a.txt"}, f.calls)
+	assert.Equal(t, []string{"read:a.txt", "read:b.txt"}, f.calls)
+}
+
+func TestMasksCoverEveryReadableTemplate(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		files map[string]string
+		a     string
+	}{
+		{"missing variable", map[string]string{"a.txt": "$MISSING", "b.txt": "${EXTRA_INPUT}"}, "a.txt"},
+		{"unreadable file", map[string]string{"b.txt": "${EXTRA_INPUT}"}, "a.txt"},
+		{"empty path", map[string]string{"b.txt": "${EXTRA_INPUT}"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := config()
+			c.ExpandFiles = map[string]string{"A_INPUT": tc.a, "B_INPUT": "b.txt"}
+			tc.files["nastools.toml"] = "project = \"example\""
+			f := &fakeOperations{files: tc.files}
+			env := environment()
+			env["EXTRA_INPUT"] = "extra.example.invalid"
+			env["GITHUB_ACTIONS"] = "true"
+			var out bytes.Buffer
+			require.NoError(t, nastools.MaskReferenced(f, "nastools.toml", c, env, &out))
+			assert.Equal(t, "::add-mask::extra.example.invalid\n", out.String())
+
+			_, err := nastools.Prepare(t.Context(), f, "nastools.toml", c, env)
+			require.ErrorIs(t, err, nastools.ErrInvalid)
+			assert.NotContains(t, err.Error(), "extra.example.invalid")
+		})
+	}
+}
+
+func TestDuplicateOutputKeepsTemplateMasks(t *testing.T) {
+	t.Parallel()
+	c := config()
+	c.Files = map[string]string{"A_INPUT": "static.txt"}
+	c.ExpandFiles = map[string]string{"A_INPUT": "a.txt"}
+	f := &fakeOperations{files: map[string]string{"a.txt": "${EXTRA_INPUT}"}}
+	env := environment()
+	env["EXTRA_INPUT"] = "extra.example.invalid"
+	inputs, err := nastools.Prepare(t.Context(), f, "nastools.toml", c, env)
+	require.ErrorContains(t, err, "duplicate output")
+	assert.Equal(t, []string{"extra.example.invalid"}, inputs.Referenced)
+}
+
+func TestMaskReferencedWriteFailure(t *testing.T) {
+	t.Parallel()
+	c := config()
+	c.ExpandFiles = map[string]string{"A_INPUT": "a.txt"}
+	f := &fakeOperations{files: map[string]string{"a.txt": "${EXTRA_INPUT}"}}
+	env := environment()
+	env["EXTRA_INPUT"] = "extra.example.invalid"
+	env["GITHUB_ACTIONS"] = "true"
+	err := nastools.MaskReferenced(f, "nastools.toml", c, env, failingWriter{})
+	require.ErrorIs(t, err, nastools.ErrInvalid)
+	assert.NotContains(t, err.Error(), "extra.example.invalid")
 }
 
 func (f *fakeOperations) Open(_ context.Context, config nastools.SSH, env map[string]string) (string, error) {
@@ -347,9 +408,13 @@ func (f *fakeOperations) Open(_ context.Context, config nastools.SSH, env map[st
 	return "/example.invalid/socket", f.openErr
 }
 
-func (f *fakeOperations) Lock(_ context.Context, path string) error {
+func (f *fakeOperations) Lock(ctx context.Context, path string) error {
 	f.calls = append(f.calls, "lock")
 	f.lockPaths = append(f.lockPaths, path)
+	if f.lockBlock {
+		<-ctx.Done()
+		return errPrivate
+	}
 	if len(f.lockErrors) == 0 {
 		return nil
 	}
@@ -360,7 +425,88 @@ func (f *fakeOperations) Lock(_ context.Context, path string) error {
 
 func (f *fakeOperations) Pause(context.Context) error {
 	f.calls = append(f.calls, "pause")
+	if f.onPause != nil {
+		f.onPause()
+	}
 	return f.pauseErr
 }
 
 func (f *fakeOperations) Close() { f.closed++; f.calls = append(f.calls, "close") }
+
+func TestExpandedReferencesAreMasked(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		template string
+		actions  bool
+		wantErr  bool
+		want     string
+	}{
+		{"referenced", "${EXTRA_INPUT}", true, false, "::add-mask::extra.example.invalid\n"},
+		{"already masked", "${REQUIRED_INPUT}", true, false, ""},
+		{"missing sibling", "${EXTRA_INPUT} ${MISSING}", true, true, "::add-mask::extra.example.invalid\n"},
+		{"outside actions", "${EXTRA_INPUT}", false, false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := &fakeOperations{files: map[string]string{
+				"nastools.toml":       configText,
+				"config/static.txt":   "static",
+				"config/expanded.txt": tc.template,
+			}}
+			env := environment()
+			env["EXTRA_INPUT"] = "extra.example.invalid"
+			if tc.actions {
+				env["GITHUB_ACTIONS"] = "true"
+			}
+			err := nastools.Execute(
+				t.Context(), f, "nastools.toml", env, &f.out, &f.out, nastools.Command{Name: nastools.CheckName},
+			)
+			masks := nastools.MaskCommands(nastools.PrivateValues(config(), env), tc.actions) + tc.want
+			if tc.wantErr {
+				require.ErrorIs(t, err, nastools.ErrInvalid)
+				assert.NotContains(t, err.Error(), "extra.example.invalid")
+				assert.Equal(t, masks, f.out.String())
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, masks, f.outputAtCompose)
+		})
+	}
+}
+
+func TestMasksSurviveEarlyValidationFailure(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		config  string
+		without string
+	}{
+		{
+			"invalid service ID",
+			configText + "[[serve]]\nservice = \"web\"\nhttps = 443\ntarget = \"http://127.0.0.1:3000\"\n",
+			"",
+		},
+		{"missing required input", configText, "REQUIRED_INPUT"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := &fakeOperations{files: map[string]string{
+				"nastools.toml":       tc.config,
+				"config/static.txt":   "static",
+				"config/expanded.txt": "${EXTRA_INPUT}",
+			}}
+			env := environment()
+			env["EXTRA_INPUT"] = "extra.example.invalid"
+			env["GITHUB_ACTIONS"] = "true"
+			delete(env, tc.without)
+			err := nastools.Execute(
+				t.Context(), f, "nastools.toml", env, &f.out, &f.out, nastools.Command{Name: nastools.CheckName},
+			)
+			require.ErrorIs(t, err, nastools.ErrInvalid)
+			assert.NotContains(t, err.Error(), "extra.example.invalid")
+			masks := nastools.MaskCommands(nastools.PrivateValues(config(), env), true)
+			assert.Equal(t, masks+"::add-mask::extra.example.invalid\n", f.out.String())
+		})
+	}
+}

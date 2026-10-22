@@ -39,16 +39,8 @@ func Run(ctx context.Context, args []string, s streams, ops nastools.Operations,
 	target, flags, findErr := cmd.Find(args)
 	remote := findErr == nil &&
 		slices.Contains([]string{nastools.CheckName, nastools.Deploy, "status", nastools.Logs}, target.Name())
-	if remote {
-		// Find the config even when flag parsing stops before reaching it.
-		target.InitDefaultHelpFlag()
-		parseErr := target.ParseFlags(flags)
-		if parseErr != nil || target.ValidateArgs(target.Flags().Args()) != nil || target.Flags().Changed("help") {
-			if _, err := nastools.Load(ops, configArgument(flags), env, s.out); err != nil {
-				fmt.Fprintln(s.err, "nastools:", err)
-				return exitError
-			}
-		}
+	if remote && failsBeforeRun(target, flags) && !maskInputs(ops, configArgument(flags), env, s) {
+		return exitError
 	}
 	if err := cmd.ExecuteContext(ctx); err != nil {
 		if remote && !errors.Is(err, nastools.ErrInvalid) {
@@ -58,6 +50,28 @@ func Run(ctx context.Context, args []string, s streams, ops nastools.Operations,
 		return exitError
 	}
 	return exitOK
+}
+
+// failsBeforeRun reports whether the command stops at its flags, arguments or help text.
+func failsBeforeRun(target *cobra.Command, flags []string) bool {
+	// Find the config even when flag parsing stops before reaching it.
+	target.InitDefaultHelpFlag()
+	return target.ParseFlags(flags) != nil ||
+		target.ValidateArgs(target.Flags().Args()) != nil || target.Flags().Changed("help")
+}
+
+// maskInputs masks the declared inputs and the template references before an
+// error or help text prints. It reports false after printing a failure.
+func maskInputs(ops nastools.Operations, path string, env map[string]string, s streams) bool {
+	config, err := nastools.Load(ops, path, env, s.out)
+	if err == nil {
+		err = nastools.MaskReferenced(ops, path, config, env, s.out)
+	}
+	if err != nil {
+		fmt.Fprintln(s.err, "nastools:", err)
+		return false
+	}
+	return true
 }
 
 func configArgument(flags []string) string {
