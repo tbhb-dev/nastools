@@ -41,6 +41,8 @@ type fakeOperations struct {
 	remotes         [][]string
 	remoteStatus    string
 	remoteFail      string
+	lockBlock       bool
+	onPause         func()
 	closed          int
 }
 
@@ -347,9 +349,13 @@ func (f *fakeOperations) Open(_ context.Context, config nastools.SSH, env map[st
 	return "/example.invalid/socket", f.openErr
 }
 
-func (f *fakeOperations) Lock(_ context.Context, path string) error {
+func (f *fakeOperations) Lock(ctx context.Context, path string) error {
 	f.calls = append(f.calls, "lock")
 	f.lockPaths = append(f.lockPaths, path)
+	if f.lockBlock {
+		<-ctx.Done()
+		return errPrivate
+	}
 	if len(f.lockErrors) == 0 {
 		return nil
 	}
@@ -360,6 +366,9 @@ func (f *fakeOperations) Lock(_ context.Context, path string) error {
 
 func (f *fakeOperations) Pause(context.Context) error {
 	f.calls = append(f.calls, "pause")
+	if f.onPause != nil {
+		f.onPause()
+	}
 	return f.pauseErr
 }
 
