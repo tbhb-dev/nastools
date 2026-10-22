@@ -192,3 +192,52 @@ func assertCommands(t *testing.T, f *nastoolstest.Fake, base []string, want [][]
 		}
 	}
 }
+
+func TestLockWaitExpiresDuringAttempt(t *testing.T) {
+	t.Parallel()
+	f := &nastoolstest.Fake{
+		Files:     map[string]string{"nastools.toml": strings.Split(configText, "[files]")[0]},
+		LockBlock: true,
+	}
+	err := nastools.Execute(
+		t.Context(), f, "nastools.toml", environment(), &f.Out, &f.Out,
+		nastools.Command{Name: "deploy", LockWait: time.Millisecond},
+	)
+	require.ErrorIs(t, err, nastools.ErrBusy)
+	require.ErrorIs(t, err, nastools.ErrInvalid)
+	assert.Len(t, f.LockPaths, 1)
+	assert.Equal(t, 1, f.Closed)
+}
+
+func TestLockParentCancelStaysGeneric(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		setup func(*nastoolstest.Fake, context.CancelFunc)
+	}{
+		{"during pause", func(f *nastoolstest.Fake, cancel context.CancelFunc) {
+			f.LockErrors = []error{nastools.ErrBusy}
+			f.OnPause = cancel
+			f.PauseErr = context.Canceled
+		}},
+		{"during long lock wait", func(f *nastoolstest.Fake, cancel context.CancelFunc) {
+			f.LockBlock = true
+			time.AfterFunc(time.Millisecond, cancel)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			f := &nastoolstest.Fake{Files: map[string]string{"nastools.toml": strings.Split(configText, "[files]")[0]}}
+			tc.setup(f, cancel)
+			err := nastools.Execute(
+				ctx, f, "nastools.toml", environment(), &f.Out, &f.Out,
+				nastools.Command{Name: "deploy", LockWait: time.Hour},
+			)
+			require.ErrorIs(t, err, nastools.ErrInvalid)
+			require.NotErrorIs(t, err, nastools.ErrBusy)
+			assert.Equal(t, 1, f.Closed)
+		})
+	}
+}

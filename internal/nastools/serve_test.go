@@ -71,6 +71,7 @@ func TestServeFailureShortCircuits(t *testing.T) {
 		change      func(*nastoolstest.Fake)
 		wantRemotes int
 	}{
+		{"pull fails", func(f *nastoolstest.Fake) { f.FailCommand = "pull" }, 0},
 		{"up fails", func(f *nastoolstest.Fake) { f.FailCommand = "up" }, 0},
 		{"first endpoint fails", func(f *nastoolstest.Fake) { f.RemoteFail = "--https=443" }, 1},
 	} {
@@ -123,6 +124,9 @@ func TestServeStatusFailures(t *testing.T) {
 	for _, tc := range []struct{ name, status, fail string }{
 		{"command", serveStatusJSON, "status"},
 		{"malformed", "not json private.example.invalid", ""},
+		{"empty", "", ""},
+		{"array", `["private.example.invalid"]`, ""},
+		{"services array", `{"Services":["private.example.invalid"]}`, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -193,6 +197,46 @@ func TestCommitLabelReachesCompose(t *testing.T) {
 			pull := slices.IndexFunc(f.Commands, func(c []string) bool { return slices.Contains(c, "pull") })
 			require.Positive(t, pull)
 			assert.Contains(t, f.Environments[pull], tc.want)
+		})
+	}
+}
+
+func TestServeStatusShapes(t *testing.T) {
+	t.Parallel()
+	for _, status := range []string{`null`, `{}`, `{"Services":null}`, `{"Services":{}}`, `{"Services":{"svc:other":{}}}`} {
+		t.Run(status, func(t *testing.T) {
+			t.Parallel()
+			f := serveFake()
+			f.RemoteStatus = status
+			require.NoError(
+				t,
+				nastools.Execute(
+					t.Context(), f, "nastools.toml", environment(), &f.Out, &f.Out, nastools.Command{Name: "status"},
+				),
+			)
+			assert.Equal(t, "compose output\ncompose diagnostic\n{}\n", f.Out.String())
+		})
+	}
+}
+
+func TestServeErrorsNameTheEntry(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ fail, want, other string }{
+		{"--https=443", "serve[0]", "serve[1]"},
+		{"--tcp=4317", "serve[1]", "serve[0]"},
+	} {
+		t.Run(tc.want, func(t *testing.T) {
+			t.Parallel()
+			f := serveFake()
+			f.RemoteFail = tc.fail
+			err := nastools.Execute(
+				t.Context(), f, "nastools.toml", environment(), &f.Out, &f.Out, nastools.Command{Name: "deploy"},
+			)
+			require.ErrorIs(t, err, nastools.ErrInvalid)
+			assert.Contains(t, err.Error(), tc.want)
+			assert.NotContains(t, err.Error(), tc.other)
+			assert.NotContains(t, err.Error(), nastoolstest.ErrPrivate.Error())
+			assert.NotContains(t, err.Error(), "svc:")
 		})
 	}
 }
