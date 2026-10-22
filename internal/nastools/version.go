@@ -21,6 +21,11 @@ const MinCompose = "2.23.1"
 // then ignores anything after a - or +.
 var composeVersion = regexp.MustCompile(`^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$`)
 
+// shownVersion matches the probe output that a refusal may echo. The echo
+// stays byte for byte as Compose printed it, so the redaction gate can still
+// match a private value in it.
+var shownVersion = regexp.MustCompile(`^[A-Za-z0-9.+_-]{1,40}$`)
+
 // withoutEngine returns a copy of the environment without the variables
 // that select a Docker engine.
 func withoutEngine(env []string) []string {
@@ -52,9 +57,9 @@ func parseVersion(text string) ([]int, bool) {
 
 // checkCompose runs before any other Compose call and refuses a local
 // Compose older than MinCompose. A refusal leaves out the adapter's text and
-// shows at most the first 40 characters that Compose printed.
+// echoes the first line that Compose printed only when that line is short
+// and uses only characters that a version can contain.
 func checkCompose(ctx context.Context, ops Operations, env []string) error {
-	const maxShown = 40
 	var out bytes.Buffer
 	if ops.Compose(ctx, []string{"version", "--short"}, withoutEngine(env), &out, nil) != nil {
 		return fmt.Errorf("compose version probe: %w", ErrInvalid)
@@ -66,8 +71,9 @@ func checkCompose(ctx context.Context, ops Operations, env []string) error {
 	if ok && slices.Compare(version, minimum) >= 0 {
 		return nil
 	}
-	if shown := []rune(line); len(shown) > maxShown {
-		line = string(shown[:maxShown])
+	read := "unparsable output"
+	if shownVersion.MatchString(line) {
+		read = "read " + line
 	}
-	return fmt.Errorf("compose version: read %q, need %s or newer: %w", line, MinCompose, ErrInvalid)
+	return fmt.Errorf("compose version: %s, need %s or newer: %w", read, MinCompose, ErrInvalid)
 }

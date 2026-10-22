@@ -4,11 +4,13 @@
 package nastools_test
 
 import (
+	"context"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -99,6 +101,45 @@ func TestComposeProbeEnvironment(t *testing.T) {
 			f := probeFake()
 			require.NoError(t, nastools.Execute(t.Context(), f, "nastools.toml", env, &f.Out, &f.Out, command))
 			assert.Equal(t, want, f.VersionEnv)
+			if command.Name == nastools.CheckName {
+				// config -q keeps the engine variables that check inherits.
+				require.Len(t, f.Environments, 1)
+				for _, name := range engine {
+					assert.Contains(t, f.Environments[0], name+"=engine.example.invalid")
+				}
+			}
+		})
+	}
+}
+
+// probeCounter counts the version probes that reach the fake.
+type probeCounter struct {
+	*nastoolstest.Fake
+
+	probes int
+}
+
+func (p *probeCounter) Compose(ctx context.Context, args, env []string, out, errOut io.Writer) error {
+	if slices.Equal(args, []string{"version", "--short"}) {
+		p.probes++
+	}
+	if err := p.Fake.Compose(ctx, args, env, out, errOut); err != nil {
+		return fmt.Errorf("compose: %w", err)
+	}
+	return nil
+}
+
+// TestComposeProbeRunsOnce checks that each successful command probes
+// Compose exactly once.
+func TestComposeProbeRunsOnce(t *testing.T) {
+	t.Parallel()
+	for _, command := range remoteCommands() {
+		t.Run(command.Name, func(t *testing.T) {
+			t.Parallel()
+			p := &probeCounter{Fake: probeFake()}
+			err := nastools.Execute(t.Context(), p, "nastools.toml", environment(), &p.Out, &p.Out, command)
+			require.NoError(t, err)
+			assert.Equal(t, 1, p.probes)
 		})
 	}
 }
@@ -106,6 +147,7 @@ func TestComposeProbeEnvironment(t *testing.T) {
 func TestComposeVersionPolicy(t *testing.T) {
 	t.Parallel()
 	long := "Docker Compose version v2.40.3 built for an example platform\nsecond line"
+	safe := strings.Repeat("a", 40)
 	for _, tc := range []struct {
 		name   string
 		output string
@@ -118,14 +160,21 @@ func TestComposeVersionPolicy(t *testing.T) {
 		{"desktop build", "2.29.7-desktop.1\n", ""},
 		{"distribution build", "2.24.6+ds1-0ubuntu1\n", ""},
 		{"surrounding space", " 2.23.1 \r\nsecond line\n", ""},
-		{"below patch", "2.23.0\n", `"2.23.0"`},
-		{"below minor", "2.9.9\n", `"2.9.9"`},
-		{"below major", "1.29.2\n", `"1.29.2"`},
-		{"below with suffix", "v2.22.9-desktop.1\n", `"v2.22.9-desktop.1"`},
-		{"empty", "", `""`},
-		{"two parts", "2.23\n", `"2.23"`},
-		{"too large", "99999999999999999999.0.0\n", `"99999999999999999999.0.0"`},
-		{"multi-line unparsable", long, strconv.Quote(long[:40])},
+		{"below patch", "2.23.0\n", "read 2.23.0"},
+		{"below minor", "2.9.9\n", "read 2.9.9"},
+		{"below major", "1.29.2\n", "read 1.29.2"},
+		{"below with suffix", "v2.22.9-desktop.1\n", "read v2.22.9-desktop.1"},
+		{"below with underscore", "2.22.9+build_1\n", "read 2.22.9+build_1"},
+		{"empty", "", "unparsable output"},
+		{"two parts", "2.23\n", "read 2.23"},
+		{"too large", "99999999999999999999.0.0\n", "read 99999999999999999999.0.0"},
+		{"40 bytes", safe + "\n", "read " + safe},
+		{"41 bytes", safe + "a\n", "unparsable output"},
+		{"multi-line unparsable", long, "unparsable output"},
+		{"quote", `"2.23.0"` + "\n", "unparsable output"},
+		{"backslash", `2.23.0\x` + "\n", "unparsable output"},
+		{"control character", "2.23.0\x1b\n", "unparsable output"},
+		{"non-ASCII", "2.23.0-\u00e9\n", "unparsable output"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -139,7 +188,7 @@ func TestComposeVersionPolicy(t *testing.T) {
 				return
 			}
 			require.ErrorIs(t, err, nastools.ErrInvalid)
-			assert.Equal(t, "compose version: read "+tc.shown+", need 2.23.1 or newer: invalid or missing input",
+			assert.Equal(t, "compose version: "+tc.shown+", need 2.23.1 or newer: invalid or missing input",
 				err.Error())
 			assert.Empty(t, f.Commands)
 		})

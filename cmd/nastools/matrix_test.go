@@ -140,6 +140,15 @@ func fixtures() []fixture {
 		{"git", func(f *nastoolstest.Fake) { f.GitErr = nastoolstest.ErrPrivate }, nil, false},
 		{"compose version probe", func(f *nastoolstest.Fake) { f.VersionErr = nastoolstest.ErrPrivate }, nil, false},
 		{"compose too old", func(f *nastoolstest.Fake) { f.ComposeVersion = []byte("2.23.0\n") }, nil, false},
+		{"compose version with canary", func(f *nastoolstest.Fake) {
+			f.ComposeVersion = []byte("2.23.0-secret-1.example.invalid\n")
+		}, nil, false},
+		{"compose version only canary", func(f *nastoolstest.Fake) {
+			f.ComposeVersion = []byte("secret-1.example.invalid\n")
+		}, nil, false},
+		{"compose version quoted canary", func(f *nastoolstest.Fake) {
+			f.ComposeVersion = []byte(`"secret-1.example.invalid"` + "\n")
+		}, nil, false},
 		{"compose config", func(f *nastoolstest.Fake) { f.FailCommand = "config" }, nil, false},
 		{"compose pull", func(f *nastoolstest.Fake) { f.FailCommand = "pull" }, nil, false},
 		{"compose up", func(f *nastoolstest.Fake) { f.FailCommand = "up" }, nil, false},
