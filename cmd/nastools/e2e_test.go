@@ -183,22 +183,23 @@ func testHostKeyMismatch(t *testing.T, f *sshFixture) {
 
 func startFixture(t *testing.T) *sshFixture {
 	t.Helper()
-	requireLocalEngine(t)
+	dockerContext := requireLocalEngine(t)
 	version, err := output(t.Context(), "docker", "version", "--format", "{{.Server.Version}}")
 	if err != nil {
 		noEngine(t, err)
 	}
 	compose := mustOutput(t, "docker", "compose", "version", "--short")
 	t.Logf("Docker Engine %s, Compose %s", strings.TrimSpace(version), strings.TrimSpace(compose))
+	build := requireLocalBuilder(t, dockerContext)
 
 	name := cmp.Or(os.Getenv("NASTOOLS_E2E_PREFIX"), "nastools-e2e") + "-" + randomSuffix()
 	f := &sshFixture{name: name, dir: t.TempDir(), container: name + "-fixture", sample: name + "-sample"}
 	f.binary = filepath.Join(f.dir, "nastools")
 	mustOutput(t, "go", "build", "-o", f.binary, ".")
 	fixtureDir := filepath.Join("..", "..", "testdata", "fixture")
-	mustOutput(t, "docker", "build", "--tag", f.container, fixtureDir)
+	build(f.container, fixtureDir)
 	removeLater(t, "image", "rm", f.container)
-	mustOutput(t, "docker", "build", "--tag", f.sample, filepath.Join(fixtureDir, "sample"))
+	build(f.sample, filepath.Join(fixtureDir, "sample"))
 	removeLater(t, "image", "rm", f.sample)
 
 	clientKey, hostKey := newKey(t), newKey(t)
@@ -219,24 +220,82 @@ func startFixture(t *testing.T) *sshFixture {
 	return f
 }
 
-// requireLocalEngine skips the test unless the Docker command-line tool
-// reaches an engine on this machine through a Unix socket. The fixture gets
-// full control of the engine it runs on, so it never runs on a remote one.
-// It reads only the environment and the Docker configuration, and doesn't
-// contact an engine.
-func requireLocalEngine(t *testing.T) {
+// requireLocalEngine ends the test unless the Docker command-line tool
+// reaches an engine on this machine through a Unix socket, and returns the
+// name of the active context. The fixture gets full control of the engine it
+// runs on, so it never runs on a remote one. It reads only the environment
+// and the Docker configuration, and doesn't contact an engine.
+func requireLocalEngine(t *testing.T) string {
 	t.Helper()
 	if host := os.Getenv("DOCKER_HOST"); host != "" && !strings.HasPrefix(host, "unix://") {
-		t.Skip("e2e: skipped: DOCKER_HOST isn't a unix:// socket, and the fixture runs only on a local engine")
+		notLocal(t, "DOCKER_HOST isn't a unix:// socket")
 	}
-	endpoint, err := output(t.Context(), "docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}")
+	active, err := output(t.Context(), "docker", "context", "inspect", "--format",
+		"{{.Name}} {{.Endpoints.docker.Host}}")
 	if err != nil {
 		noEngine(t, err)
 	}
-	if !strings.HasPrefix(strings.TrimSpace(endpoint), "unix://") {
-		t.Skip("e2e: skipped: the active Docker context isn't a unix:// socket, " +
-			"and the fixture runs only on a local engine")
+	name, endpoint, _ := strings.Cut(strings.TrimSpace(active), " ")
+	if !strings.HasPrefix(endpoint, "unix://") {
+		notLocal(t, "the active Docker context isn't a unix:// socket")
 	}
+	return name
+}
+
+// requireLocalBuilder ends the test unless the builder named after the active
+// Docker context uses the docker driver, which builds on that context's
+// engine. It returns a function that builds an image there. The builds drop
+// BUILDX_BUILDER and select that builder explicitly, so no other builder
+// selection reaches them.
+func requireLocalBuilder(t *testing.T, dockerContext string) func(tag, dir string) {
+	t.Helper()
+	env := slices.DeleteFunc(os.Environ(), func(entry string) bool {
+		return strings.HasPrefix(entry, "BUILDX_BUILDER=")
+	})
+	out, err := combined(t.Context(), env, "docker", "buildx", "inspect", dockerContext)
+	if err != nil {
+		notLocal(t, fmt.Sprintf("Docker Buildx can't inspect the builder %s: %v", dockerContext, err))
+	}
+	var name, driver string
+	var endpoints []string
+	for line := range strings.Lines(out) {
+		key, value, _ := strings.Cut(line, ":")
+		value = strings.TrimSpace(value)
+		switch key {
+		case "Name":
+			name = cmp.Or(name, value)
+		case "Driver":
+			driver = value
+		case "Endpoint":
+			endpoints = append(endpoints, value)
+		}
+	}
+	if name != dockerContext || driver != "docker" || !slices.Equal(endpoints, []string{dockerContext}) {
+		notLocal(t, fmt.Sprintf("the builder %s doesn't use the docker driver on the active context", dockerContext))
+	}
+	return func(tag, dir string) {
+		t.Helper()
+		_, buildErr := combined(t.Context(), env, "docker", "buildx", "build", "--builder", dockerContext, "--load",
+			"--tag", tag, dir)
+		require.NoError(t, buildErr)
+	}
+}
+
+// mustRun reports whether a test run has to reach the scenarios instead of
+// skipping them. A CI run on Linux does, so the required check can't pass
+// without exercising anything.
+func mustRun(goos string, getenv func(string) string) bool {
+	return goos == "linux" && (getenv("CI") != "" || getenv("GITHUB_ACTIONS") != "")
+}
+
+// notLocal ends a test whose engine or builder isn't local. It fails a CI
+// run on Linux and skips anywhere else.
+func notLocal(t *testing.T, reason string) {
+	t.Helper()
+	if mustRun(runtime.GOOS, os.Getenv) {
+		t.Fatalf("e2e: %s, and the fixture runs only on a local engine", reason)
+	}
+	t.Skipf("e2e: skipped: %s, and the fixture runs only on a local engine", reason)
 }
 
 // noEngine ends a test when no Docker engine answers. It skips on macOS,
