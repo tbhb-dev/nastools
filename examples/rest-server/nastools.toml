@@ -1,0 +1,20 @@
+# Placeholders only. A consumer keeps its real values in the environment and
+# in a local file that stays out of version control.
+project = "rest-server"
+compose = ["compose.yaml"]
+wait_seconds = 120
+required_env = ["REST_SERVER_DATA_PATH", "REST_SERVER_UID", "REST_SERVER_GID"]
+
+[ssh]
+address_env = "SSH_ADDRESS"
+user_env = "SSH_USER"
+known_hosts_env = "SSH_KNOWN_HOSTS"
+lock_dir_env = "SSH_LOCK_DIR"
+
+[files]
+HTPASSWD = "secrets/htpasswd"
+
+[[serve]]
+service = "svc:rest-server"
+https = 443
+target = "http://127.0.0.1:8000"

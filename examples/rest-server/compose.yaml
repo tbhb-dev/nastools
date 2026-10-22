@@ -1,0 +1,36 @@
+---
+# An append-only restic rest-server. The image is pinned by digest; the digest
+# is the multi-architecture index of the 0.14.0 tag.
+services:
+  rest-server:
+    image: restic/rest-server:0.14.0@sha256:d2aff06f47eb38637dff580c3e6bce4af98f386c396a25d32eb6727ec96214a5
+    # The image entrypoint is a script that sets its own options, so run the
+    # server directly.
+    entrypoint: ["rest-server"]
+    command:
+      - --append-only
+      - --path
+      - /data
+      - --htpasswd-file
+      - /run/secrets/htpasswd
+    user: "${REST_SERVER_UID:?}:${REST_SERVER_GID:?}"
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ${REST_SERVER_DATA_PATH:?}:/data
+    secrets:
+      - htpasswd
+    # Any HTTP response counts, including 401, so the service is healthy
+    # before the first repository exists.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -S -O /dev/null http://127.0.0.1:8000/ 2>&1 | grep -q 'HTTP/'"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+secrets:
+  htpasswd:
+    environment: HTPASSWD

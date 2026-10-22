@@ -55,3 +55,8 @@ stretchr
 nastoolstest
 tailnet
 Pwritev
+healthcheck
+htpasswd
+HTPASSWD
+restic
+RESTIC
