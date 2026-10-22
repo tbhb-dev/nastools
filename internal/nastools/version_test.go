@@ -32,24 +32,37 @@ func remoteCommands() []nastools.Command {
 	}
 }
 
-// TestComposeProbeRunsFirst checks that a failed probe stops each command
-// before any other Compose call and before the transport opens.
+// TestComposeProbeRunsFirst checks that a failed probe or a release below
+// the floor stops each command before any other Compose call and before the
+// transport opens.
 func TestComposeProbeRunsFirst(t *testing.T) {
 	t.Parallel()
-	for _, command := range remoteCommands() {
-		t.Run(command.Name, func(t *testing.T) {
-			t.Parallel()
-			f := probeFake()
-			f.VersionErr = nastoolstest.ErrPrivate
-			err := nastools.Execute(t.Context(), f, "nastools.toml", environment(), &f.Out, &f.Out, command)
-			require.ErrorIs(t, err, nastools.ErrInvalid)
-			assert.Contains(t, err.Error(), "compose version probe")
-			assert.NotContains(t, err.Error(), nastoolstest.ErrPrivate.Error())
-			assert.NotNil(t, f.VersionEnv)
-			assert.Empty(t, f.Commands)
-			assert.Equal(t, []string{"read:nastools.toml", "git"}, f.Calls)
-			assert.Zero(t, f.Closed)
-		})
+	for _, fault := range []struct {
+		name    string
+		change  func(*nastoolstest.Fake)
+		message string
+	}{
+		{"failed probe", func(f *nastoolstest.Fake) { f.VersionErr = nastoolstest.ErrPrivate }, "compose version probe"},
+		{
+			"below floor", func(f *nastoolstest.Fake) { f.ComposeVersion = []byte("2.23.0\n") },
+			"compose version: read 2.23.0, need 2.23.1 or newer",
+		},
+	} {
+		for _, command := range remoteCommands() {
+			t.Run(fault.name+"/"+command.Name, func(t *testing.T) {
+				t.Parallel()
+				f := probeFake()
+				fault.change(f)
+				err := nastools.Execute(t.Context(), f, "nastools.toml", environment(), &f.Out, &f.Out, command)
+				require.ErrorIs(t, err, nastools.ErrInvalid)
+				assert.Contains(t, err.Error(), fault.message)
+				assert.NotContains(t, err.Error(), nastoolstest.ErrPrivate.Error())
+				assert.NotNil(t, f.VersionEnv)
+				assert.Empty(t, f.Commands)
+				assert.Equal(t, []string{"read:nastools.toml", "git"}, f.Calls)
+				assert.Zero(t, f.Closed)
+			})
+		}
 	}
 }
 
@@ -147,7 +160,7 @@ func TestComposeProbeRunsOnce(t *testing.T) {
 func TestComposeVersionPolicy(t *testing.T) {
 	t.Parallel()
 	long := "Docker Compose version v2.40.3 built for an example platform\nsecond line"
-	safe := strings.Repeat("a", 40)
+	suffix := strings.Repeat("a", 60)
 	for _, tc := range []struct {
 		name   string
 		output string
@@ -163,18 +176,21 @@ func TestComposeVersionPolicy(t *testing.T) {
 		{"below patch", "2.23.0\n", "read 2.23.0"},
 		{"below minor", "2.9.9\n", "read 2.9.9"},
 		{"below major", "1.29.2\n", "read 1.29.2"},
-		{"below with suffix", "v2.22.9-desktop.1\n", "read v2.22.9-desktop.1"},
-		{"below with underscore", "2.22.9+build_1\n", "read 2.22.9+build_1"},
+		{"below with suffix", "v2.22.9-desktop.1\n", "read 2.22.9"},
+		{"below with underscore", "2.22.9+build_1\n", "read 2.22.9"},
+		{"below with long suffix", "2.20.0-" + suffix + "\n", "read 2.20.0"},
+		{"below with leading zeros", "v02.020.000\n", "read 2.20.0"},
+		{"below with surrounding space", "\t2.23.0 \n", "read 2.23.0"},
+		{"below with non-ASCII suffix", "2.23.0-\u00e9\n", "read 2.23.0"},
 		{"empty", "", "unparsable output"},
-		{"two parts", "2.23\n", "read 2.23"},
-		{"too large", "99999999999999999999.0.0\n", "read 99999999999999999999.0.0"},
-		{"40 bytes", safe + "\n", "read " + safe},
-		{"41 bytes", safe + "a\n", "unparsable output"},
+		{"blank", " \n", "unparsable output"},
+		{"two parts", "2.23\n", "unparsable output"},
+		{"too large", "99999999999999999999.0.0\n", "unparsable output"},
+		{"long word", suffix + "\n", "unparsable output"},
 		{"multi-line unparsable", long, "unparsable output"},
 		{"quote", `"2.23.0"` + "\n", "unparsable output"},
 		{"backslash", `2.23.0\x` + "\n", "unparsable output"},
 		{"control character", "2.23.0\x1b\n", "unparsable output"},
-		{"non-ASCII", "2.23.0-\u00e9\n", "unparsable output"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
