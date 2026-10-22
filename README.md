@@ -41,7 +41,7 @@ The lock directory is an existing absolute directory on the network-attached sto
 
 Every required variable and SSH input must have a non-empty value. Static files enter the Compose child environment unchanged. An optional `[expand_files]` table uses the same output-variable-to-path format and expands environment references in memory. Use it only for a backend without native credential-file or file-backed expansion support. Missing expansion inputs and unknown config fields fail the check. The config and each file it names must be a regular file of at most 1 MiB. nastools checks the type before it opens one, so a named pipe, a device, or a larger file fails as unreadable instead of blocking the run. Each Serve entry selects either `https` or `tcp`, with a matching HTTP(S) or TCP target, and uses a unique (Service ID, port) pair. A Service ID has the form `svc:` plus a DNS label of lowercase letters, digits, and hyphens, with no leading or trailing hyphen and at most 63 characters. Ports, including the port in a target, range from 1 to 65535.
 
-With a non-empty `GITHUB_ACTIONS` value, every command first reads the config without validating it and emits a mask command for each private value it finds, before any other output. A malformed config still yields its values, and a key matches in any case, as the strict parser accepts it. If the config doesn't read or parse, every error prints only `invalid or missing input`, so no command echoes its arguments. nastools treats as private the value of each required variable and SSH input, the host names in the SSH address and known-hosts values, the variables that `[expand_files]` templates reference, each `[files]` line of at least eight characters, and each entry in the comma-separated `NASTOOLS_PRIVATE_STRINGS`. nastools then writes standard output and standard error line by line, including Compose and Serve output, and replaces each private value and each `*.ts.net` host name, in any case, with `***`. A host name seen for the first time gets its own mask command before its line. A failed mask write stops the command before it starts, or fails it with a nonzero exit later. Line buffering can change how lines from the two streams interleave. nastools refuses the hidden shell-completion commands, which would write past the redaction. Without `GITHUB_ACTIONS`, output passes through unchanged.
+With a non-empty `GITHUB_ACTIONS` value, every command first reads the config without validating it and emits a mask command for each private value it finds, before any other output. A malformed config still yields its values, and a key matches in any case, as the strict parser accepts it. If the config doesn't read or parse, every error prints only `invalid or missing input`, so no command echoes its arguments. nastools treats as private the value of each required variable and SSH input, the host names in the SSH address and known-hosts values, the variables that `[expand_files]` templates reference, each `[files]` line of at least eight bytes, and each entry in the comma-separated `NASTOOLS_PRIVATE_STRINGS`. nastools then writes standard output and standard error line by line, including Compose and Serve output, and replaces each private value and each `*.ts.net` host name, in any case, with `***`. A host name seen for the first time gets its own mask command before its line. A failed mask write stops the command before it starts, or fails it with a nonzero exit later. Line buffering can change how lines from the two streams interleave. nastools refuses the hidden shell-completion commands, which would write past the redaction. Without `GITHUB_ACTIONS`, output passes through unchanged.
 
 Redaction doesn't cover:
 
@@ -50,7 +50,7 @@ Redaction doesn't cover:
 - A Go runtime panic, which writes past the redacting writers.
 - The step's `env:` block, which the runner prints before nastools starts. Pass private values through `secrets.*`, not `vars.*`.
 - Standard output that doesn't reach the runner. Under GitHub Actions, standard output carries each private value inside its `::add-mask::` line. Redirecting it to a file, or through `tee` to a file that a later step uploads as an artifact, exposes every value. Leave the standard output of nastools connected to the runner.
-- Short values: lines under eight characters within a multi-line value or a `[files]` file, and host names that short. nastools replaces a short value of its own wherever it appears.
+- Short values: lines under eight bytes within a multi-line value or a `[files]` file, and host names that short. nastools replaces a short value of its own wherever it appears.
 - Application output in `logs`, beyond the known values.
 
 Git state supplies the commit label, with `-dirty` for modified or new files.
@@ -107,10 +107,10 @@ nastools runs Compose on the machine that runs nastools and points it at the dev
 | --- | --- | --- |
 | `env_file`, the project `.env` file, and variable interpolation | The local machine | While parsing the model |
 | `configs` with `content:` or `environment:` sources, and `secrets` with `environment:` sources | The local machine | Copied into the container after Compose creates it and before it starts |
-| Local build contexts | The local machine | Sent to the engine when building |
+| Local build contexts | The local machine | Sent when building to the selected builder, which is the device's engine only with the default builder for `DOCKER_HOST` |
 | Bind-mount sources and, outside swarm mode, `configs` and `secrets` with `file:` sources, which become bind mounts | The device, at the path resolved on the local machine | When the engine creates the container |
 
-Compose resolves a relative path against the project directory, which nastools sets to the config's directory. The engine then mounts that same absolute path from the device, so the file has to exist there at that path. A `file:` config or secret that's missing on the device fails container creation. For a `file:` secret that's missing on the local machine, Compose only warns, and it doesn't check a `file:` config there. A bind mount whose source is missing on the device doesn't fail: the engine creates an empty directory there, unless the long syntax sets `bind.create_host_path: false`. Because Compose reads `env_file` while parsing, it can never read an `env_file` that a service generates on the device. A missing `env_file` fails the parse unless it sets `required: false`, which only skips it.
+Compose resolves a relative path against the project directory, which nastools sets to the config's directory. The engine then mounts that same absolute path from the device, so the file has to exist there at that path. A `file:` config or secret that's missing on the device fails container creation. For a `file:` secret that's missing on the local machine, Compose only warns, and it doesn't check a `file:` config there. A bind mount whose source is missing on the device doesn't fail: the engine creates an empty directory there, unless the long syntax sets `bind.create_host_path: false`. Because Compose reads `env_file` while parsing, it can never read an `env_file` that a service generates on the device. A missing `env_file` fails the parse unless its long form sets `required: false`, which only skips it. That form needs Compose 2.24.0 or later.
 
 To generate a secret on the device, run an init one-shot that writes into a named volume only when the file is missing. Services mount the volume and read the secret as a file, and `depends_on` with `condition: service_completed_successfully` starts them after the init:
 
@@ -121,7 +121,7 @@ services:
     command:
       - sh
       - -c
-      - test -s /secrets/token || { head -c 24 /dev/random | base64 > /secrets/token.tmp && mv /secrets/token.tmp /secrets/token; }
+      - test -e /secrets/token || { head -c 24 /dev/random | base64 > /secrets/token.tmp && sync /secrets/token.tmp && mv /secrets/token.tmp /secrets/token; }
     volumes:
       - secrets:/secrets
   example:
@@ -135,7 +135,7 @@ volumes:
   secrets:
 ```
 
-The guard matters because `up` starts the exited one-shot again on every deploy, and if the one-shot has the commit label, Compose recreates it on every commit. An init without the guard would replace the secret each time. Writing through a temporary file and `mv` keeps an interrupted init from leaving a partial secret that the guard would then keep. The secret lasts as long as the volume, and `compose down -v` removes both.
+The guard matters because `up` starts the exited one-shot again on every deploy, and if the one-shot has the commit label, Compose recreates it on every commit. An init without the guard would replace the secret each time. The guard tests only that the file exists, so it keeps an existing file even when that file is empty. Writing to a temporary file and flushing it with `sync` before `mv` renames it keeps an interrupted init or a power loss from leaving a partial or empty secret that the guard would then keep. The secret lasts as long as the volume, and `compose down -v` removes both.
 
 File content can reach a service without a file on the device through these routes:
 
@@ -144,7 +144,9 @@ File content can reach a service without a file on the device through these rout
 - An image built from a local build context.
 - An init one-shot that writes a volume from an environment variable.
 
-Each `[files]` value reaches Compose as one environment string, so the system running Compose limits its size. On Linux, the kernel limits one environment string, counting the name, the `=`, the value, and the ending null byte, to 32 pages. With 4 KiB pages that's 128 KiB, well below the 1 MiB file cap. macOS instead limits arguments and environment together, to the system's `ARG_MAX`. The init one-shot route also passes the value into the container's environment, so the device's Linux kernel applies the same per-string limit when the container process starts, and a larger macOS `ARG_MAX` doesn't raise that ceiling.
+An init one-shot fed from an environment variable leaves the value in the container's configuration on the device, where `docker inspect` shows it. When that matters, use `secrets.environment` instead.
+
+Each `[files]` value and each `[expand_files]` output reaches Compose as one environment string, so the system running Compose limits its size. On Linux, the kernel limits one environment string, counting the name, the `=`, the value, and the ending null byte, to 32 pages. With 4 KiB pages that's 128 KiB, well below the 1 MiB file cap. Linux also caps arguments and environment together, at a size derived from the stack limit, so two large values can fail together where each would fit alone. macOS limits only arguments and environment together, to the system's `ARG_MAX`. The init one-shot route also passes the value into the container's environment, so the device's Linux kernel applies the same limits when the container process starts, and a larger macOS `ARG_MAX` doesn't raise that ceiling.
 
 ## Releases
 
