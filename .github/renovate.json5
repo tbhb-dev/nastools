@@ -18,8 +18,8 @@
   prConcurrentLimit: 0,
   prHourlyLimit: 0,
   extends: [
-    "github>tbhb-dev/devtools//.github/renovate-config.json5#1dde4f53da5fcbee3876dc2cb67da59e52b63479", // v0.15.0
-    "github>tbhb-dev/devtools//.github/renovate-go-config.json5#1dde4f53da5fcbee3876dc2cb67da59e52b63479", // v0.15.0
+    "github>tbhb-dev/devtools//.github/renovate-config.json5#1901c9a096a76f08746e116dbbf22a521ab25de0", // v0.16.0
+    "github>tbhb-dev/devtools//.github/renovate-go-config.json5#1901c9a096a76f08746e116dbbf22a521ab25de0", // v0.16.0
   ],
 
   repositories: ["tbhb-dev/nastools"],
