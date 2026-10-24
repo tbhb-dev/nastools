@@ -36,7 +36,7 @@ repos:
   # devtools:install-pre-push-hook wrapper sits in front of prek's pre-push
   # hook, because prek hides git's ref lines from its hooks.
   - repo: https://github.com/tbhb-dev/devtools
-    rev: 1901c9a096a76f08746e116dbbf22a521ab25de0  # frozen: v0.16.0
+    rev: 8dff05b148c3a468dbf0e6e8fb48092bd5cbb418  # frozen: v0.18.0
     hooks:
       - id: commit-trailers
       - id: commitlint

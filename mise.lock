@@ -15,19 +15,19 @@ url = "https://github.com/microsoft/apm/releases/download/v0.33.0/apm-darwin-arm
 url_api = "https://api.github.com/repos/microsoft/apm/releases/assets/606234085"
 
 [[tools."go:github.com/tbhb-dev/devtools/cmd/agentrepo"]]
-version = "0.16.0"
+version = "0.18.0"
 backend = "go:github.com/tbhb-dev/devtools/cmd/agentrepo"
 
 [[tools."go:github.com/tbhb-dev/devtools/cmd/commit-lint"]]
-version = "0.16.0"
+version = "0.18.0"
 backend = "go:github.com/tbhb-dev/devtools/cmd/commit-lint"
 
 [[tools."go:github.com/tbhb-dev/devtools/cmd/gh-post"]]
-version = "0.16.0"
+version = "0.18.0"
 backend = "go:github.com/tbhb-dev/devtools/cmd/gh-post"
 
 [[tools."go:github.com/tbhb-dev/devtools/cmd/guard-markdown"]]
-version = "0.16.0"
+version = "0.18.0"
 backend = "go:github.com/tbhb-dev/devtools/cmd/guard-markdown"
 
 [[tools.jq]]
