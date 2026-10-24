@@ -11,7 +11,7 @@ idiomatic_version_file_enable_tools = []
 
 [tools]
 # vendir can't come from the payload it delivers: bootstrap syncs before it installs.
-vendir = "0.46.1"
+vendir = "0.46.3"
 apm = "0.33.0"
 shfmt = "3.14.1"
 jq = "1.8.2"
