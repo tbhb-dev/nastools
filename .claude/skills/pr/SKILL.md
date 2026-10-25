@@ -91,7 +91,7 @@ It resolves the base to `origin/<base>` where origin has a copy, the same commit
 | 124 | The reviewer timed out without a stamp |
 | 5 | The draft, `HEAD`, or the base moved while the review ran |
 
-On findings, revise the draft in this session or pass them verbatim to the optional `write-pr-description` helper, then run the review again. Bound it at three rounds, counting only the rounds a finding caused. A round the branch caused doesn't count against the bound: a remediation commit or a rebase changes what the description has to describe. Say which kind each round was as you go, so the count is accurate. Past three, stop, report the count with the findings that keep coming back, and let the operator decide whether to go on.
+On findings, revise the draft in this session or pass them verbatim to the optional `write-pr-description` helper, then run the review again. Bound it at three rounds, counting only the rounds a finding caused. A round the branch caused doesn't count against the bound: a remediation commit or a rebase changes what the description has to describe. Say which kind each round was as you go, so the count is accurate. At the bound, start the redesign described below.
 
 The script records every readable verdict with the draft digest and branch head. After `CHANGES REQUIRED`, it refuses to send byte-identical text for the same head to another reviewer. The reviewer can read a changed draft.
 
@@ -107,13 +107,15 @@ review_cmd = agy -p "$(cat)" --mode plan --add-dir "$DEVTOOLS_REVIEW_INPUTS" --p
 
 `DEVTOOLS_REVIEW_CMD`, `DEVTOOLS_REVIEW_MODEL`, and `DEVTOOLS_REVIEW_EFFORT`, or the same keys in `~/.config/devtools/<repository>.conf`, replace the default reviewer. No repository file can.
 
+When the unattended finding bound returns exit 3, run `agentrepo review redesign KIND --reason TEXT` with `KIND` set to `commit`, `pr` or `squash`, then rewrite the draft from scratch. A rejected digest for the same subject refuses review before invoking the reviewer. Each active record permits one redesign. A bound after redesign requires inspection and refuses another start. Legacy records without rejected digests require inspection. The command leaves write authority and every other gate unchanged. A fresh description reset, where supported, remains separate from redesign.
+
 ## Step 5: run the validator and the prose gates
 
 ```text
 mise run lint-pr-description
 ```
 
-That task runs the mechanical checks, then vale and cspell over the draft. The validator settles the frontmatter structure, the title's form and bounds, section presence and order, empty sections, surviving comments, unclosed fences, dead links, and whether every backticked path exists. It reads the title's type and the paths against origin's copy of the base, as the review does. Each finding gives a line and the fix.
+That task runs the mechanical checks, then vale and cspell over the draft. The validator settles the frontmatter structure, the title's form and bounds, section presence and order, empty sections, surviving comments, unclosed fences, dead links, and whether every backticked path exists. It reads the title's type and the paths against origin's copy of the base, as the review does. Each finding gives a line and the fix. Section findings (`section-missing`, `section-order`, `section-empty`) end with `; template: <path>`, naming the working-tree template file the validator read.
 
 Resolve every one through `fix-prose` rather than editing it yourself, because a direct edit here spends the context that skill exists to save. Edited the draft either way? Then step 4 runs again, because the stamp binds bytes rather than intentions.
 
@@ -238,4 +240,4 @@ Preflight checks each. Where one is missing, tell the operator rather than impro
 
 ## API quota
 
-Identity and explicit readers use GraphQL, which doesn't spend REST core quota. Each checks snapshot uses one GraphQL call. Quota failures return 76 and print the resource's reset time. Other API failures keep GitHub's error. The watcher returns 2 for ordinary check-read failures. A missing reset header needs one REST `/rate_limit` lookup, which doesn't consume core quota. GitHub CLI writes can still spend REST quota resolving or applying labels, milestones, reviewers, and assignees. Scripts never retry writes automatically.
+Identity and explicit readers use GraphQL, which doesn't spend REST core quota. Each checks snapshot uses one GraphQL call. Quota failures return 76. The printed message says which limit applied and what to do next: wait at least a minute after a secondary limit, or read the budget with a GraphQL `rateLimit { remaining resetAt }` query once a primary GraphQL limit has passed. GitHub doesn't report the reset time with the failure. No script looks it up through `/rate_limit`. The original error follows unchanged. Other API failures keep GitHub's error. The watcher returns 2 for ordinary check-read failures. GitHub CLI writes can still spend REST quota resolving or applying labels, milestones, reviewers, and assignees. Scripts never retry writes automatically.

@@ -136,10 +136,47 @@ dt_session_id() {
 
 # --- configuration -----------------------------------------------------
 
-# Probe in the sourcing shell so command substitutions share the cached answer.
-if [ -z "${_DEVTOOLS_AGENTREPO_CONFIG+set}" ]; then
+# Resolve in the sourcing shell so command substitutions share the binary.
+readonly DT_AGENTREPO_MIN_VERSION=v0.16.0
+_dt_agentrepo_resolve() {
+  local root binary version
+  binary=''
+  # Environment-only configuration still works when Git lookup fails.
+  if root=$(dt_root); then
+    binary=$(cd "$root" && mise which agentrepo 2>/dev/null) || binary=''
+  fi
+  if [ -z "$binary" ] || [ ! -x "$binary" ]; then
+    binary=$(command -v agentrepo) || return 0
+  fi
+  version=$("$binary" --version) || dt_die "Could not read agentrepo version: $binary"
+  version=${version##* }
+  # Source builds report DEV, or a v0.0.0 pseudo-version when Go stamps
+  # the module; release binaries must meet the version floor.
+  if [ "$version" != DEV ] && ! awk -v found="$version" -v required="$DT_AGENTREPO_MIN_VERSION" '
+    BEGIN {
+      sub(/^v/, "", found)
+      sub(/^v/, "", required)
+      if (found ~ /^0[.]0[.]0-[0-9]{14}-[0-9a-f]{12}/) exit 0
+      if (found !~ /^[0-9]+[.][0-9]+[.][0-9]+([-+].*)?$/) exit 1
+      prerelease = found ~ /-/
+      sub(/[-+].*/, "", found)
+      split(found, f, ".")
+      split(required, r, ".")
+      for (i = 1; i <= 3; i++) {
+        if (f[i]+0 > r[i]+0) exit 0
+        if (f[i]+0 < r[i]+0) exit 1
+      }
+      exit prerelease ? 1 : 0
+    }
+  '; then
+    dt_die "agentrepo found $version; required $DT_AGENTREPO_MIN_VERSION or newer"
+  fi
+  printf '%s\n' "$binary"
+}
+if [ -z "${_DEVTOOLS_AGENTREPO_BIN+set}" ]; then
+  _DEVTOOLS_AGENTREPO_BIN=$(_dt_agentrepo_resolve) || exit $?
   _DEVTOOLS_AGENTREPO_CONFIG=false
-  if agentrepo config --help >/dev/null 2>&1; then
+  if [ -n "$_DEVTOOLS_AGENTREPO_BIN" ] && "$_DEVTOOLS_AGENTREPO_BIN" config --help >/dev/null 2>&1; then
     _DEVTOOLS_AGENTREPO_CONFIG=true
   fi
 fi
@@ -171,7 +208,7 @@ _dt_conf_file() {
 # dt_conf <key> [default]: the configured value, or the default.
 dt_conf() {
   if [ "$_DEVTOOLS_AGENTREPO_CONFIG" = true ]; then
-    agentrepo config machine -- "$@"
+    "$_DEVTOOLS_AGENTREPO_BIN" config machine -- "$@"
     return $?
   fi
   local key=$1 default=${2:-} env_name value dir repo
@@ -403,8 +440,8 @@ dt_run_reviewer() {
   local root=$1 inputs=$2 custom model effort timeout
   local runner=(env)
   timeout=$(dt_conf review_timeout 900)
-  if command -v agentrepo >/dev/null 2>&1 && agentrepo --help >/dev/null 2>&1; then
-    runner=(agentrepo review run --timeout "${timeout}s" --)
+  if [ -n "$_DEVTOOLS_AGENTREPO_BIN" ] && "$_DEVTOOLS_AGENTREPO_BIN" --help >/dev/null 2>&1; then
+    runner=("$_DEVTOOLS_AGENTREPO_BIN" review run --timeout "${timeout}s" --)
   else
     printf 'review: unbounded because agentrepo is missing or unusable\n' >&2
   fi
@@ -517,6 +554,12 @@ dt_review() {
     printf 'review: %s is not the text prepared for review; gather it again\n' "$(basename "$draft")" >&2
     return 5
   fi
+  if [ "${DEVTOOLS_UNATTENDED:-0}" = 1 ]; then
+    dt_agent_context || return $?
+    dt_agent_rounds "$kind" "$subject" check "$before" || return $?
+    repo_digest=$(dt_repo_digest) || return $?
+    set -- "$@" repo_config "$repo_digest"
+  fi
   verdict_record=$state/$kind.verdict
   if [ -f "$verdict_record" ] &&
     grep -Fqx "subject $subject" "$verdict_record" &&
@@ -524,12 +567,6 @@ dt_review() {
     grep -Fqx 'verdict changes' "$verdict_record"; then
     printf 'BLOCKED: this byte-identical draft already has CHANGES REQUIRED for the same review subject. Change the draft or ask the operator.\n' >&2
     return 3
-  fi
-  if [ "${DEVTOOLS_UNATTENDED:-0}" = 1 ]; then
-    dt_agent_context || return $?
-    dt_agent_rounds "$kind" "$subject" || return $?
-    repo_digest=$(dt_repo_digest) || return $?
-    set -- "$@" repo_config "$repo_digest"
   fi
   if [ -f "$inputs/review-policy-report.txt" ]; then
     cat "$inputs/review-policy-report.txt"
@@ -578,7 +615,7 @@ dt_review() {
     printf 'subject %s\ndraft %s\nverdict changes\n' "$subject" "$before" >"$verdict_record"
     cat "$reply"
     if [ "${DEVTOOLS_UNATTENDED:-0}" = 1 ]; then
-      dt_agent_rounds "$kind" "$subject" finding || return $?
+      dt_agent_rounds "$kind" "$subject" finding "$before" || return $?
     fi
     return 2
     ;;
@@ -766,10 +803,14 @@ dt_gh_post() {
 }
 
 # dt_gh preserves gh's failure status; quota exhaustion has status 76.
-# Only quota failures need the extra rate_limit reset lookup. Never retry a
+# A rate limit is recognized only from gh's own error lines on stderr after a
+# non-zero exit: a line starting with "gh: " or "GraphQL: " that carries one of
+# GitHub's rate-limit messages. gh never prints response headers, so the reset
+# time isn't known from the failure and nothing here asks GET /rate_limit,
+# which can disagree with the budget the failing call hit. Never retry a
 # mutation: its outcome may already have taken effect on GitHub.
 dt_gh() {
-  local err status reset resource
+  local err status line arg kind='' graphql=0 msg
   err=$(mktemp) || return 1
   if gh "$@" 2>"$err"; then
     cat "$err" >&2
@@ -778,17 +819,33 @@ dt_gh() {
   else
     status=$?
   fi
-  if grep -qiE 'rate.?limit|API rate limit exceeded' "$err"; then
-    resource=core
-    case "$*" in
-    *graphql* | 'pr view '* | 'pr list '* | 'pr checks '* | 'repo view '* | 'label list '* | 'issue list '*) resource=graphql ;;
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in
+    'GraphQL: '*) graphql=1 ;;
+    'gh: '*) graphql=0 ;;
+    *) continue ;;
     esac
-    if grep -qi 'GraphQL' "$err"; then resource=graphql; fi
-    reset=$(awk 'tolower($1) == tolower("X-RateLimit-Reset:") { print $2; exit }' "$err")
-    if [ -z "$reset" ]; then
-      reset=$(gh api rate_limit --jq ".resources.${resource}.reset" 2>/dev/null) || reset=""
+    case $line in
+    *'secondary rate limit'*) kind=secondary ;;
+    *'API rate limit exceeded for'* | *'API rate limit already exceeded for'*) kind=primary ;;
+    *) continue ;;
+    esac
+    break
+  done <"$err"
+  if [ -n "$kind" ]; then
+    # Every gh subcommand other than "gh api <REST path>" spends the GraphQL budget.
+    if [ "${1:-}" != api ]; then graphql=1; fi
+    for arg in "$@"; do
+      if [ "$arg" = graphql ]; then graphql=1; fi
+    done
+    if [ "$kind" = secondary ]; then
+      msg="rate limit: GitHub secondary rate limit; the reset time isn't known from the failure. Wait at least one minute before the next request, as GitHub's docs advise; no budget query helps."
+    elif [ "$graphql" = 1 ]; then
+      msg="rate limit: GitHub primary GraphQL rate limit, inferred from the command and the error line; the reset time isn't known from the failure. Once the limit has passed, read the budget with a GraphQL rateLimit { remaining resetAt } query, never /rate_limit."
+    else
+      msg="rate limit: GitHub primary REST rate limit, inferred from the command and the error line; the reset time isn't known from the failure. The budget can't be read reliably from here: wait for the hourly window and treat /rate_limit as advisory only."
     fi
-    printf 'rate limit: GitHub %s quota exhausted; reset time: %s. Rerun after the reset; no automatic retry was made.\n' "$resource" "${reset:-unavailable (see GitHub error below)}" >&2
+    printf '%s No automatic retry was made.\n' "$msg" >&2
     status=76
   fi
   cat "$err" >&2
