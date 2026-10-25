@@ -17,6 +17,7 @@ import (
 
 	"github.com/tbhb-dev/nastools/internal/nastools"
 	"github.com/tbhb-dev/nastools/internal/nastools/nastoolstest"
+	"github.com/tbhb-dev/nastools/internal/redact"
 )
 
 const (
@@ -81,6 +82,7 @@ func matrixEnv() map[string]string {
 	env := map[string]string{
 		"GITHUB_ACTIONS":           "true",
 		"NASTOOLS_PRIVATE_STRINGS": "secret-6.example.invalid",
+		"PADDED_INPUT":             "\tsecret-1.example.invalid",
 		"REQUIRED_INPUT":           "secret-1.example.invalid",
 		"SSH_ADDRESS":              "secret-2.example.invalid:22",
 		"SSH_USER":                 "secret-3.example.invalid",
@@ -157,6 +159,8 @@ func fixtures() []fixture {
 		{"invalid serve", replace("https = 443", "https = 0"), nil, false},
 		{"duplicate output", replace("EXPANDED_INPUT =", "STATIC_INPUT ="), nil, false},
 		{"missing env", replace(`["REQUIRED_INPUT"]`, `["REQUIRED_INPUT", "ABSENT_INPUT"]`), nil, false},
+		// The fake prints the value without its tab.
+		{"tab-prefixed required input", replace(`["REQUIRED_INPUT"]`, `["PADDED_INPUT"]`), nil, false},
 		{"template read", func(f *nastoolstest.Fake) { delete(f.Files, "expanded.txt") }, []string{
 			"secret-5.example.invalid",
 		}, false},
@@ -305,13 +309,14 @@ func (w *faultyWriter) Write(p []byte) (int, error) {
 func (w *faultyWriter) String() string { return w.buf.String() }
 
 type matrixCase struct {
-	name     string
-	fixture  fixture
-	command  string
-	shape    string
-	args     []string
-	failAt   int
-	noConfig bool
+	name       string
+	fixture    fixture
+	command    string
+	shape      string
+	args       []string
+	failAt     int
+	afterMasks bool
+	noConfig   bool
 }
 
 // matrixCases crosses every command and argument shape with every config
@@ -338,28 +343,46 @@ func matrixCases() []matrixCase {
 		"short help":     {"-h"},
 		"missing config": {"--config=missing.toml"},
 	}
-	// The fixture's discovery writes ten masks.
-	writers := map[string]int{"healthy": 0, "first write fails": 1, "write after masks fails": 11}
+	// -1 stands for the first write after the case's discovery masks.
+	writers := map[string]int{"healthy": 0, "first write fails": 1, "write after masks fails": -1}
 	all := fixtures()
 	cases := make([]matrixCase, 0, len(all)*len(commands)*len(shapes)*len(writers))
 	for _, fx := range all {
 		for command, commandArgs := range commands {
 			for shape, shapeArgs := range shapes {
+				args := slices.Concat(commandArgs, shapeArgs)
 				for writer, failAt := range writers {
+					afterMasks := failAt < 0
+					if afterMasks {
+						failAt = discoveryMasks(fx, args) + 1
+					}
 					cases = append(cases, matrixCase{
-						name:     fx.name + "/" + command + "/" + shape + "/" + writer,
-						fixture:  fx,
-						command:  command,
-						shape:    shape,
-						args:     slices.Concat(commandArgs, shapeArgs),
-						failAt:   failAt,
-						noConfig: shape == "missing config",
+						name:       fx.name + "/" + command + "/" + shape + "/" + writer,
+						fixture:    fx,
+						command:    command,
+						shape:      shape,
+						args:       args,
+						failAt:     failAt,
+						afterMasks: afterMasks,
+						noConfig:   shape == "missing config",
 					})
 				}
 			}
 		}
 	}
 	return cases
+}
+
+// discoveryMasks counts the masks that discovery writes for the fixture
+// and arguments, the way Run registers them.
+func discoveryMasks(fx fixture, args []string) int {
+	f := matrixFake()
+	fx.change(f)
+	var out bytes.Buffer
+	gate := redact.New(&out, io.Discard, true, redact.TailnetName)
+	private := nastools.Discover(f.ReadFile, configArgument(args), matrixEnv())
+	gate.Register(redact.Set{Values: private.Values, Hosts: private.Hosts})
+	return strings.Count(out.String(), maskPrefix)
 }
 
 func TestRunNeverPrintsPrivateValues(t *testing.T) {
@@ -391,11 +414,24 @@ func TestRunNeverPrintsPrivateValues(t *testing.T) {
 			if out.maskFailed {
 				assert.NotEqual(t, exitOK, code)
 			}
+			assertAfterMasks(t, tc, out, errOut.String())
 			if tc.failAt == 0 {
 				assertExit(t, tc, code, errOut.String())
 			}
 		})
 	}
+}
+
+// assertAfterMasks checks that, when standard output fails on the first
+// write after the discovery masks, every discovery mask got through, and
+// only those.
+func assertAfterMasks(t *testing.T, tc matrixCase, out *faultyWriter, stderr string) {
+	t.Helper()
+	if !tc.afterMasks {
+		return
+	}
+	assert.Equal(t, tc.failAt-1, strings.Count(out.String(), maskPrefix))
+	assert.NotContains(t, stderr, "nastools: mask output:")
 }
 
 // assertExit checks the exit status of every case whose outcome the fixture

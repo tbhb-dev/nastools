@@ -60,3 +60,4 @@ htpasswd
 HTPASSWD
 restic
 RESTIC
+netdns
